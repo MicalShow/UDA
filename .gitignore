@@ -1,0 +1,22 @@
+# Generated builds, local dependencies and deployment data
+/bin/
+/release-*/
+/validation*/
+/handoff*/
+/DatabaseProvider/*
+!/DatabaseProvider/packages.lock.json
+!/DatabaseProvider/Licenses/
+!/DatabaseProvider/Licenses/**
+*.exe
+*.dll
+*.pdb
+*.log
+*.udadb
+*.7z
+*.zip
+*.pfx
+*.pem
+*.key
+.uda-*/
+*.user
+.vs/

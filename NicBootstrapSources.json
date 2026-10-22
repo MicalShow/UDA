@@ -1,0 +1,124 @@
+{
+  "SchemaVersion": 1,
+  "AsOf": "2026-07-28",
+  "Note": "NIC 官方来源目录 / Curated official NIC driver source catalog. Each entry is a CONFIRMED OFFICIAL ENTRY POINT (download center / support portal / docs page) as of the AsOf date. It deliberately contains NO direct binary download URLs and NO SHA-256 hashes: those must be recorded by the operator at import time from the package they actually downloaded and verified. License notes reflect public licensing posture; the operator is responsible for confirming redistribution rights per package before marking a package redistributable. Default: packages from vendors not known to grant redistribution are NOT marked publishable (see NicBootstrapCatalog.RedistributionAllowed).",
+  "Vendors": [
+    {
+      "Vendor": "Intel",
+      "PciVendorIds": ["8086"],
+      "UsbVendorIds": [],
+      "OfficialPage": "https://www.intel.com/content/www/us/en/download-center/home.html",
+      "LicenseStatus": "restricted",
+      "RedistributionAllowedByDefault": false,
+      "Notes": "Intel Ethernet adapter drivers are governed by the Intel Software License Agreement; some packages additionally require accepting a Limited Distribution License (LDL) before download. Redistribution is restricted; OEMs may redistribute under specific LDL terms. Confirm per package before marking redistributable."
+    },
+    {
+      "Vendor": "Realtek",
+      "PciVendorIds": ["10EC"],
+      "UsbVendorIds": ["0BDA"],
+      "OfficialPage": "https://www.realtek.com/en/",
+      "LicenseStatus": "restricted",
+      "RedistributionAllowedByDefault": false,
+      "Notes": "Realtek publishes NIC drivers through its official download portal; the portal availability and direct links change over time. Many Realtek NIC drivers are distributed by system OEMs rather than directly. Confirm redistribution rights before bundling."
+    },
+    {
+      "Vendor": "Broadcom",
+      "PciVendorIds": ["14E4"],
+      "UsbVendorIds": [],
+      "OfficialPage": "https://www.broadcom.com/support/download-search",
+      "LicenseStatus": "restricted",
+      "RedistributionAllowedByDefault": false,
+      "Notes": "Broadcom NetXtreme/NetXtreme II drivers are available via Broadcom support; many downloads require a Broadcom support account or OEM entitlement. Redistribution restricted."
+    },
+    {
+      "Vendor": "Qualcomm/Atheros",
+      "PciVendorIds": ["168C"],
+      "UsbVendorIds": ["17CB"],
+      "OfficialPage": "https://www.qualcomm.com/products",
+      "LicenseStatus": "oem",
+      "RedistributionAllowedByDefault": false,
+      "Notes": "Qualcomm does not generally host end-user Atheros WLAN/NIC drivers; they must be acquired from the system OEM. No direct public download entry; treat as OEM-only."
+    },
+    {
+      "Vendor": "MediaTek/Ralink",
+      "PciVendorIds": ["14C3"],
+      "UsbVendorIds": ["1814"],
+      "OfficialPage": "https://www.mediatek.com/products/networking",
+      "LicenseStatus": "oem",
+      "RedistributionAllowedByDefault": false,
+      "Notes": "MediaTek (which acquired Ralink) publishes networking product pages; end-user drivers are mostly distributed by OEMs. Treat as OEM acquisition required."
+    },
+    {
+      "Vendor": "Marvell/Aquantia",
+      "PciVendorIds": ["11AB", "1D6A"],
+      "UsbVendorIds": [],
+      "OfficialPage": "https://www.marvell.com/support/downloads.html",
+      "LicenseStatus": "restricted",
+      "RedistributionAllowedByDefault": false,
+      "Notes": "Marvell (which acquired Aquantia in 2019) hosts adapter drivers on its support downloads page; many require a Marvell support account. Aquantia AQtion 10G NICs use PCI vendor 1D6A; legacy Marvell uses 11AB."
+    },
+    {
+      "Vendor": "Mellanox/Nvidia",
+      "PciVendorIds": ["15B3"],
+      "UsbVendorIds": [],
+      "OfficialPage": "https://networking.nvidia.com/products/adapter-ethernet/",
+      "LicenseStatus": "restricted",
+      "RedistributionAllowedByDefault": false,
+      "Notes": "Nvidia (which acquired Mellanox) distributes Windows OFED (WinOF/WinOF2) drivers for ConnectX adapters. Governed by the Nvidia networking driver license; confirm redistribution terms per package."
+    },
+    {
+      "Vendor": "ASIX",
+      "PciVendorIds": [],
+      "UsbVendorIds": ["0B95"],
+      "OfficialPage": "https://www.asix.com.tw/products.htm",
+      "LicenseStatus": "restricted",
+      "RedistributionAllowedByDefault": false,
+      "Notes": "ASIX publishes USB-to-LAN (AX88179/AX88772/AX88772B/AX88179A) drivers on its products page. License terms apply; confirm redistribution rights before bundling."
+    },
+    {
+      "Vendor": "Microchip/SMSC",
+      "PciVendorIds": [],
+      "UsbVendorIds": ["0424"],
+      "OfficialPage": "https://www.microchip.com/en-us/development-tools-tools-and-software/development-tools/search",
+      "LicenseStatus": "restricted",
+      "RedistributionAllowedByDefault": false,
+      "Notes": "Microchip (which acquired SMSC in 2012) hosts LAN95xx/LAN97xx USB Ethernet drivers via its development tools search. SMSC USB NICs use VID 0424."
+    },
+    {
+      "Vendor": "VirtIO (Red Hat)",
+      "PciVendorIds": ["1AF4"],
+      "UsbVendorIds": [],
+      "OfficialPage": "https://docs.fedoraproject.org/en-US/quick-docs/creating-windows-virtual-machines-using-virtio-drivers/",
+      "LicenseStatus": "redistributable",
+      "RedistributionAllowedByDefault": true,
+      "Notes": "virtio-win NetKVM drivers for KVM/QEMU virtual NICs (PCI vendor 1AF4) are part of the Fedora virtio-win project and are publicly redistributable under their GPL/BSD-style license. Obtain the virtio-win ISO from the official Fedora virtio-win project; the operator records the verified package hash at import time."
+    },
+    {
+      "Vendor": "VMware",
+      "PciVendorIds": ["15AD"],
+      "UsbVendorIds": [],
+      "OfficialPage": "https://docs.vmware.com/en/VMware-Tools/",
+      "LicenseStatus": "oem",
+      "RedistributionAllowedByDefault": false,
+      "Notes": "VMware vmxnet3 / vlance virtual NIC drivers (PCI vendor 15AD) ship in-box with VMware Tools; there is no standalone redistributable driver package. Install via VMware Tools under its EULA."
+    },
+    {
+      "Vendor": "Hyper-V (Microsoft)",
+      "PciVendorIds": ["1414"],
+      "UsbVendorIds": [],
+      "OfficialPage": "https://learn.microsoft.com/en-us/windows-hardware/drivers/network/",
+      "LicenseStatus": "inbox",
+      "RedistributionAllowedByDefault": false,
+      "Notes": "Hyper-V virtual NIC (netvsc, PCI vendor 1414) drivers ship in-box with Windows; no separate download is required or distributed. Listed for coverage tracking only."
+    }
+  ],
+  "CommonUsbNics": [
+    { "Name": "ASIX AX88179 / AX88179A (USB 3.0 to Gigabit Ethernet)", "UsbVid": "0B95", "UsbPid": "1790", "Vendor": "ASIX" },
+    { "Name": "ASIX AX88772 (USB 2.0 to Fast Ethernet)", "UsbVid": "0B95", "UsbPid": "7720", "Vendor": "ASIX" },
+    { "Name": "ASIX AX88772B (USB 2.0 to Fast Ethernet)", "UsbVid": "0B95", "UsbPid": "772B", "Vendor": "ASIX" },
+    { "Name": "Realtek RTL8152 (USB 2.0 10/100)", "UsbVid": "0BDA", "UsbPid": "8152", "Vendor": "Realtek" },
+    { "Name": "Realtek RTL8153 (USB 3.0 Gigabit)", "UsbVid": "0BDA", "UsbPid": "8153", "Vendor": "Realtek" },
+    { "Name": "Realtek RTL8156 (USB 3.0 2.5G)", "UsbVid": "0BDA", "UsbPid": "8156", "Vendor": "Realtek" },
+    { "Name": "Microchip/SMSC LAN9514 (USB 2.0 hub+Ethernet)", "UsbVid": "0424", "UsbPid": "EC00", "Vendor": "Microchip/SMSC" }
+  ]
+}

@@ -1,0 +1,17 @@
+# ─── 万能驱动助手 路径配置 ───
+# 每行一个路径，#开头是注释
+# {MODEL}自动替换为电脑型号（如 LenovoThinkPadX1Carbon）
+#
+# 格式1（当前用户访问SMB）:
+#   \\服务器\共享名
+#   \\服务器\共享名\{MODEL}
+#
+# 格式2（指定用户名密码访问SMB）:
+#   \\服务器\共享名|domain\用户名|密码
+#
+# 格式3（本地路径）:
+#   D:\ Drivers
+
+\\192.168.1.100\Drivers
+\\192.168.1.100\Drivers\{MODEL}
+\\192.168.1.101\Share|Administrator|MyPassword

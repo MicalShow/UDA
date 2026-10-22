@@ -1,0 +1,71 @@
+﻿{
+  "_说明": "万能驱动助手配置。请保持为标准 JSON；以 _ 开头的字段仅作注释。",
+  "General": {
+    "LogDirectory": "%ProgramData%\\UniversalDriverAssistant\\Logs",
+    "ReportDirectory": "%ProgramData%\\UniversalDriverAssistant\\Reports",
+    "InstallTimeoutSeconds": 120,
+    "DeploymentCountdownSeconds": 5,
+    "AutoReboot": false,
+    "RebootDelaySeconds": 30,
+    "CreateRestorePoint": true,
+    "ScanAllSourcesWhenModelPackageMissing": true,
+    "ScanAllSourcesAfterModelPackage": false,
+    "IncludeDisconnectedDevices": false
+  },
+  "Sources": [
+    {
+      "_说明": "部署时推荐给 SCCM 运行账户或计算机账户授予共享及 NTFS 只读权限。",
+      "Name": "公司驱动库",
+      "Path": "\\\\fileserver\\Drivers$",
+      "Priority": 10,
+      "Enabled": true,
+      "Username": "",
+      "Password": ""
+    },
+    {
+      "Name": "本地缓存",
+      "Path": "D:\\Drivers",
+      "Priority": 20,
+      "Enabled": false,
+      "Username": "",
+      "Password": ""
+    }
+  ],
+  "ModelMappings": [
+    {
+      "_说明": "厂商、机型和 SKU 支持 * 与 ?；Priority 越小越优先。",
+      "Name": "示例：ThinkPad T14 Gen 6 AMD",
+      "ManufacturerPattern": "LENOVO*",
+      "ModelPattern": "21QJ*",
+      "SystemSKUPattern": "*",
+      "DriverPath": "Lenovo\\ThinkPad T14 Gen 6 AMD",
+      "Priority": 10,
+      "Enabled": false
+    },
+    {
+      "_说明": "路径支持 {Manufacturer}、{Model}、{SystemSKU} 变量。",
+      "Name": "按厂商与机型目录自动映射",
+      "ManufacturerPattern": "*",
+      "ModelPattern": "*",
+      "SystemSKUPattern": "*",
+      "DriverPath": "{Manufacturer}\\{Model}",
+      "Priority": 1000,
+      "Enabled": false
+    }
+  ],
+  "Categories": {
+    "Network": [ "Net", "Network", "NIC" ],
+    "Display": [ "Display", "Video", "GPU" ],
+    "Audio": [ "MEDIA", "AudioEndpoint", "Sound" ],
+    "Storage": [ "SCSIAdapter", "HDC", "Storage", "DiskDrive" ],
+    "Chipset": [ "System", "Firmware", "SecurityDevices" ],
+    "Bluetooth": [ "Bluetooth" ],
+    "USB": [ "USB" ],
+    "Other": []
+  },
+  "Filters": {
+    "IncludeCategories": [],
+    "ExcludeHardwareIds": [],
+    "OnlyMissingOrProblemDevicesInMaintenance": false
+  }
+}

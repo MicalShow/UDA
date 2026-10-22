@@ -1,0 +1,72 @@
+[
+  {
+    "package": "MySqlConnector",
+    "version": "2.4.0",
+    "url": "https://api.nuget.org/v3-flatcontainer/mysqlconnector/2.4.0/mysqlconnector.2.4.0.nupkg",
+    "sha256": "bf2995a0bd46dc86be991ecbdf0707c2fbea2fed9777da89c6c581b89ef1895b",
+    "framework": "net462"
+  },
+  {
+    "package": "Microsoft.Extensions.Logging.Abstractions",
+    "version": "8.0.2",
+    "url": "https://api.nuget.org/v3-flatcontainer/microsoft.extensions.logging.abstractions/8.0.2/microsoft.extensions.logging.abstractions.8.0.2.nupkg",
+    "sha256": "707a5ef17d818186b90f3ba565fab6e2b83c3b62b92e6ab63a22e1a320158097",
+    "framework": "net462"
+  },
+  {
+    "package": "System.Diagnostics.DiagnosticSource",
+    "version": "8.0.1",
+    "url": "https://api.nuget.org/v3-flatcontainer/system.diagnostics.diagnosticsource/8.0.1/system.diagnostics.diagnosticsource.8.0.1.nupkg",
+    "sha256": "ce6c078dc26029c6e49307a91f4dfc421727b16309707cacf8f11b1460b4260a",
+    "framework": "net462"
+  },
+  {
+    "package": "System.Threading.Tasks.Extensions",
+    "version": "4.5.4",
+    "url": "https://api.nuget.org/v3-flatcontainer/system.threading.tasks.extensions/4.5.4/system.threading.tasks.extensions.4.5.4.nupkg",
+    "sha256": "a304a963cc0796c5179f9c6b7d8022bbce3b2fa7c029eb6196f631f7b462d678",
+    "framework": "net461"
+  },
+  {
+    "package": "Microsoft.Extensions.DependencyInjection.Abstractions",
+    "version": "8.0.2",
+    "url": "https://api.nuget.org/v3-flatcontainer/microsoft.extensions.dependencyinjection.abstractions/8.0.2/microsoft.extensions.dependencyinjection.abstractions.8.0.2.nupkg",
+    "sha256": "51f2df1100245f10da54f0bb7e813f277155117777d4fbbab902214e27372606",
+    "framework": "net462"
+  },
+  {
+    "package": "System.Buffers",
+    "version": "4.5.1",
+    "url": "https://api.nuget.org/v3-flatcontainer/system.buffers/4.5.1/system.buffers.4.5.1.nupkg",
+    "sha256": "c30b3dd2c7e2f4cee4b823d692fd42118309b42ab1f5007f923d329a5b0d6b12",
+    "framework": "net461"
+  },
+  {
+    "package": "System.Memory",
+    "version": "4.5.5",
+    "url": "https://api.nuget.org/v3-flatcontainer/system.memory/4.5.5/system.memory.4.5.5.nupkg",
+    "sha256": "10f43da352a29fb2b3188e4edd4dcf5100194c8b526e4f61fe2e2b5623775a22",
+    "framework": "net461"
+  },
+  {
+    "package": "System.Runtime.CompilerServices.Unsafe",
+    "version": "6.0.0",
+    "url": "https://api.nuget.org/v3-flatcontainer/system.runtime.compilerservices.unsafe/6.0.0/system.runtime.compilerservices.unsafe.6.0.0.nupkg",
+    "sha256": "6c41b53e70e9eee298cff3a02ce5acdd15b04125589be0273f0566026720a762",
+    "framework": "net461"
+  },
+  {
+    "package": "Microsoft.Bcl.AsyncInterfaces",
+    "version": "8.0.0",
+    "url": "https://api.nuget.org/v3-flatcontainer/microsoft.bcl.asyncinterfaces/8.0.0/microsoft.bcl.asyncinterfaces.8.0.0.nupkg",
+    "sha256": "f5a5a68b03092ab2abf68843d4a4aea25dfbcbe8dd0f13c625cb779b6fc1927c",
+    "framework": "net462"
+  },
+  {
+    "package": "System.Numerics.Vectors",
+    "version": "4.5.0",
+    "url": "https://api.nuget.org/v3-flatcontainer/system.numerics.vectors/4.5.0/system.numerics.vectors.4.5.0.nupkg",
+    "sha256": "a9d49320581fda1b4f4be6212c68c01a22cdf228026099c20a8eabefcf90f9cf",
+    "framework": "net46"
+  }
+]
