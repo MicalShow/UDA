@@ -1,4 +1,4 @@
-<# .SYNOPSIS 编译并运行 INF 适用性引擎测试 / Compile & run the INF applicability engine tests. #>
+﻿<# .SYNOPSIS 编译并运行 INF 适用性引擎测试 / Compile & run the INF applicability engine tests. #>
 [CmdletBinding()]param([string]$OutputDirectory)
 Set-StrictMode -Version 2.0;$ErrorActionPreference='Stop';$root=Split-Path -Parent $MyInvocation.MyCommand.Path
 if([string]::IsNullOrWhiteSpace($OutputDirectory)){$OutputDirectory=Join-Path $root 'inf-applicability-test-results'}

@@ -2,7 +2,7 @@
 
 Universal Driver Assistant 是面向 Windows 桌面运维、系统部署和 SCCM 任务序列的驱动管理工具，提供局域网服务端、在线客户端与离线工具。
 
-当前源码版本：**5.3.9**。许可证：[MIT](LICENSE)。第三方依赖保留各自的许可，见 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)。
+当前源码版本：**5.3.45**。许可证：[MIT](LICENSE)。第三方依赖保留各自的许可，见 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)。
 
 ## 主要功能
 
@@ -61,3 +61,9 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Run-DatabaseMigrationT
 ```
 
 核心协议测试使用合成驱动和模拟安装执行器，不会向真实硬件安装驱动。真实 SCCM、厂商驱动和网络部署仍应在隔离测试环境验收。其他验证脚本可能启动临时数据库、产生文件或需要外部工具，请先阅读对应脚本。
+
+## 5.3.45 更新
+
+完善原生硬件清单、扩展驱动与 Models 适用性匹配；SCCM 同次运行持续复扫安装并最终核验，不增加额外重启流程。增加持续诊断日志、跨机数据库连接恢复、安装错误收集与缺失归档补齐脚本。
+
+LAN/GUI 完整回归在 5.3.43 为 666/172 项断言；5.3.45 安装和数据库测试 67 项通过。实际机型 SCCM 部署及音频功能仍需现场验收。

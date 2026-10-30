@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Data.Common;
 using System.Drawing;
 using System.IO;
@@ -30,7 +30,15 @@ namespace UDA
             if (args.Length == 1 && args[0] == "--upgrade-test-child") { System.Threading.Thread.Sleep(1000); return 0; }
             try
             {
+                if (args.Length == 1 && args[0] == "--setup-output-child") {
+                    for (int i = 0; i < 1000; i++) Console.WriteLine("PROGRESS: " + i);
+                    Console.Error.WriteLine("FINAL-ERROR-MARKER"); return 7;
+                }
                 string root = Path.GetFullPath(args[0]); Directory.CreateDirectory(root);
+                var setupOutput = new System.Collections.Generic.List<string>(); var setupOutputGate = new object();
+                int setupExit = ServerUpgrade.RunSetupProcess(typeof(DatabaseMigrationHarness).Assembly.Location, "--setup-output-child", line => { lock (setupOutputGate) setupOutput.Add(line); });
+                Check(setupExit == 7 && setupOutput.Count == 1001 && setupOutput.Contains("FINAL-ERROR-MARKER"), "setup drains both output streams before process disposal, preserving final failure");
+                Check(ServerUpgrade.SetupFailureSummary(string.Join("\n", Enumerable.Repeat("PROGRESS: pending", 1000)) + "\nOfflineRepoGenerator ERROR: missing archive\n stack").Contains("missing archive"), "setup error summary prioritizes actual error above progress output");
                 string configuredInstaller = ServerUpgrade.PrepareInstallerRuntime(typeof(DatabaseMigrationHarness).Assembly.Location, Path.Combine(root, "installer-runtime-" + Guid.NewGuid().ToString("N")));
                 Check(File.Exists(configuredInstaller) && OfflineRepoGenerator.Sha256File(configuredInstaller) == OfflineRepoGenerator.Sha256File(typeof(DatabaseMigrationHarness).Assembly.Location), "single-file installer bootstrap preserves executable payload bytes");
                 var runtime = System.Xml.Linq.XDocument.Load(configuredInstaller + ".config");

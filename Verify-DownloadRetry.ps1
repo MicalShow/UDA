@@ -1,4 +1,4 @@
-param([string]$OutputDirectory = 'release-v5.0.0')
+﻿param([string]$OutputDirectory = 'release-v5.0.0')
 $ErrorActionPreference='Stop'
 [void][Reflection.Assembly]::LoadFrom((Join-Path $PSScriptRoot ($OutputDirectory+'\Lan\UDA-Server-Manager.exe')))
 Add-Type -TypeDefinition @'

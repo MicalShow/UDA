@@ -1,4 +1,4 @@
-<# .SYNOPSIS 配置生成器布局与 JSON 往返测试 / Config editor layout and JSON round-trip tests. #>
+﻿<# .SYNOPSIS 配置生成器布局与 JSON 往返测试 / Config editor layout and JSON round-trip tests. #>
 [CmdletBinding()]param([string]$OutputDirectory)
 Set-StrictMode -Version 2.0;$ErrorActionPreference='Stop';$root=Split-Path -Parent $MyInvocation.MyCommand.Path
 if([string]::IsNullOrWhiteSpace($OutputDirectory)){$OutputDirectory=Join-Path $root 'config-generator-test-results'}

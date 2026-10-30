@@ -1,4 +1,4 @@
-﻿// InfApplicability.cs — reusable INF candidate applicability engine.
+// InfApplicability.cs — reusable INF candidate applicability engine.
 // Compiled by the in-box CSharpCodeProvider (C# 5.0). No third-party dependencies.
 //
 // Single source of truth for "does this INF candidate apply to this OS/device?".
@@ -154,14 +154,34 @@ namespace UDA
             if (!haveIds)
                 return MakeApplicable(bestApplied, InfMatchLevel.None, "", "", "", "");
 
-            // Only model entries whose own decoration is applicable may match.
+            // Windows selects ONE best Models section per Manufacturer line. Older
+            // sections must not contribute IDs, even if their minimum build also matches.
+            // An empty newer section intentionally excludes devices supported by older sections.
+            var selected = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            var sections = record.ModelSections ?? new List<InfModelSection>();
+            if (sections.Count == 0)
+            {
+                // Existing database indexes already retain all decorations, including empty
+                // sections. Apply the single-manufacturer rule without rebuilding the library.
+                sections = new List<InfModelSection>();
+                foreach (var dec in decorations) sections.Add(new InfModelSection { Decoration = dec });
+            }
+            foreach (var section in sections)
+            {
+                if (!DecorationApplicable(section.Decoration, target)) continue;
+                string group = section.Group ?? "", previous;
+                if (!selected.TryGetValue(group, out previous) || CompareDecorations(section.Decoration, previous) > 0)
+                    selected[group] = section.Decoration ?? "";
+            }
             List<InfModelEntry> usableEntries = new List<InfModelEntry>();
             if (record.Models != null)
             {
                 foreach (var m in record.Models)
                 {
                     if (m == null) continue;
-                    if (DecorationApplicable(m.Decoration, target)) usableEntries.Add(m);
+                    string active;
+                    string group = record.ModelSections != null && record.ModelSections.Count > 0 ? (m.ModelGroup ?? "") : "";
+                    if (selected.TryGetValue(group, out active) && string.Equals(active, m.Decoration ?? "", StringComparison.OrdinalIgnoreCase)) usableEntries.Add(m);
                 }
             }
             if (usableEntries.Count == 0)
@@ -195,6 +215,14 @@ namespace UDA
         public static bool DecorationApplicable(string decoration, OsTarget target)
         {
             return OsArchFilter.DecorationRejection(decoration, target, false).Length == 0;
+        }
+
+        private static int CompareDecorations(string left, string right)
+        {
+            int[] a = { OsArchFilter.OsMajorFromDecoration(left), OsArchFilter.OsMinorFromDecoration(left), OsArchFilter.MinBuildFromDecoration(left), OsArchFilter.ArchFromDecoration(left) == "any" || string.IsNullOrEmpty(left) ? 0 : 1 };
+            int[] b = { OsArchFilter.OsMajorFromDecoration(right), OsArchFilter.OsMinorFromDecoration(right), OsArchFilter.MinBuildFromDecoration(right), OsArchFilter.ArchFromDecoration(right) == "any" || string.IsNullOrEmpty(right) ? 0 : 1 };
+            for (int i = 0; i < a.Length; i++) { int result = a[i].CompareTo(b[i]); if (result != 0) return result; }
+            return 0;
         }
 
         // -------------------------------------------------------------------------

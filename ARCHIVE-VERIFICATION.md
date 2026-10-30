@@ -1,4 +1,4 @@
-﻿# 5.3.3：安装前复用归档核验结果
+# 5.3.3：安装前复用归档核验结果
 
 安装时先读取 MySQL 的 repo.archive-verification.json 与 repo.archive-hashes.json，检查每个独立 ZIP 的 Windows 文件标识、卷标识、长度、创建/修改/变更时间、属性、核验规则版本，以及该 ZIP 对应的 INF 路径/哈希/包根目录/包哈希。全部一致且没有待核对的散装 packages 目录时，直接复用已核验结果，不重新读取 ZIP 内容、不解压逐项校验。
 

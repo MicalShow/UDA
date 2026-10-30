@@ -1,4 +1,4 @@
-<# .SYNOPSIS 测试机型整包、内存、磁盘健康、资源监控与导出校验。 #>
+﻿<# .SYNOPSIS 测试机型整包、内存、磁盘健康、资源监控与导出校验。 #>
 [CmdletBinding()]param([string]$OutputDirectory)
 Set-StrictMode -Version 2.0;$ErrorActionPreference='Stop';$root=Split-Path -Parent $MyInvocation.MyCommand.Path
 if([string]::IsNullOrWhiteSpace($OutputDirectory)){$OutputDirectory=Join-Path $root 'enhanced-test-results'}

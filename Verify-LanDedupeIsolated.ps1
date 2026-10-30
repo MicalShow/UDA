@@ -1,4 +1,4 @@
-$ErrorActionPreference = 'Stop'
+﻿$ErrorActionPreference = 'Stop'
 $assembly = [Reflection.Assembly]::LoadFrom((Join-Path $PSScriptRoot 'verify-v483-complete\LanHarness.exe'))
 $type = $assembly.GetType('UDA.LanHarness')
 $method = $type.GetMethod('TestAdminDedupe', [Reflection.BindingFlags]'Static,NonPublic')

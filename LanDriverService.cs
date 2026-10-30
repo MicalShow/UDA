@@ -1,4 +1,4 @@
-﻿// LanDriverService.cs - Phase 3B: self-hosted LAN driver service + client.
+// LanDriverService.cs - Phase 3B: self-hosted LAN driver service + client.
 //
 // A pure .NET Framework (System.Net.HttpListener) self-hosted driver service for Windows Server, plus the
 // matching client that bootstraps a missing NIC driver from a local offline repo, then reports the target
@@ -106,6 +106,7 @@ namespace UDA
 
     public sealed class LanReportRequest
     {
+        public bool SupportsExtensionPackages;
         public int Protocol = LanProtocol.Version;
         public string RequestId = "";
         public string MachineName = Environment.MachineName;
@@ -138,6 +139,8 @@ namespace UDA
 
     public sealed class LanCandidateDto
     {
+        public string ExtensionId = "";
+        public bool IsExtension;
         public string DeviceInstanceId = "";
         public string DownloadBaseUrl = "";
         public string FriendlyName = "";
@@ -160,11 +163,115 @@ namespace UDA
         public int MatchLevel;
         public string MatchedInfId = "";
         public bool NeedInstall;
+        public string OemBrand = "", MachineBrand = "";
+        // Optional flat alternatives; old clients ignore these fields. Model packages remain atomic.
+        public string ReleaseChannel = "";
+        public List<LanCandidateDto> Versions = new List<LanCandidateDto>();
+        [System.Web.Script.Serialization.ScriptIgnore]
+        public bool UserSelectedVersion;
         public string LocalRejectionReason = "";
         // Decorated Models sections of the matched INF (e.g. "NTamd64.10"). Lets the client re-run the
         // SAME OS/arch applicability rule the server used, so a candidate shown as installable can never
         // be skipped at install time for an applicability reason. Empty on old servers = trust the server.
         public List<string> Decorations = new List<string>();
+    }
+
+    public static class LanExtensionPackages
+    {
+        private static readonly ConcurrentDictionary<string, Lazy<InfRecord>> LegacyModels = new ConcurrentDictionary<string, Lazy<InfRecord>>(StringComparer.OrdinalIgnoreCase);
+        public static InfRecord CompleteRepositoryModels(OfflineRepo repo, InfRecord record)
+        {
+            if (record == null || (record.ModelSections != null && record.ModelSections.Count > 0) || record.Models == null || record.Models.Count == 0) return record;
+            string key = repo.RepoRoot + "|" + record.Path + "|" + record.ContentHash;
+            try {
+                return LegacyModels.GetOrAdd(key, k => new Lazy<InfRecord>(() => ReadRepositoryRecord(repo, record), true)).Value;
+            } catch { Lazy<InfRecord> failed; LegacyModels.TryRemove(key, out failed); throw; }
+        }
+        private static readonly ConcurrentDictionary<string, string> Ids = new ConcurrentDictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        public static bool IsIntelSgpcPlatformExtension(InfRecord record, Guid extensionId)
+        {
+            // The signed Intel HdBusExt lineage configures the PCI audio controller,
+            // not OEM speaker calibration. Its deliberate VEN/DEV-only targets are generic.
+            if (record == null || extensionId != new Guid("69CB4EDD-BAFE-4F9A-9135-C1F284D6860D") ||
+                (record.Provider ?? "").IndexOf("Intel", StringComparison.OrdinalIgnoreCase) < 0) return false;
+            var ids = (record.HardwareIds ?? new List<string>()).Concat(record.CompatibleIds ?? new List<string>()).ToList();
+            return ids.Count > 0 && ids.All(id => System.Text.RegularExpressions.Regex.IsMatch(id ?? "", @"^PCI\\VEN_8086&DEV_[0-9A-F]{4}$", System.Text.RegularExpressions.RegexOptions.IgnoreCase));
+        }
+        public static bool MatchesExtensionTarget(InfRecord record, Guid extensionId, InfApplicabilityResult verdict)
+        {
+            if (verdict == null || !verdict.Applicable) return false;
+            if (verdict.MatchLevel == InfMatchLevel.HardwareId) return true;
+            // PCI VEN/DEV is normally in CompatibleIds, not the subsystem-specific HardwareIds.
+            // Only this known generic controller lineage may use that match; OEM calibration stays exact.
+            return verdict.MatchLevel == InfMatchLevel.CompatibleIdVsHardwareId &&
+                IsIntelSgpcPlatformExtension(record, extensionId) &&
+                System.Text.RegularExpressions.Regex.IsMatch(verdict.MatchedInfId ?? "", @"^PCI\\VEN_8086&DEV_[0-9A-F]{4}$", System.Text.RegularExpressions.RegexOptions.IgnoreCase) &&
+                string.Equals(verdict.MatchedDeviceId, verdict.MatchedInfId, StringComparison.OrdinalIgnoreCase);
+        }
+        public static bool IsExtension(InfRecord record)
+        { return record != null && (string.Equals(record.Class, "Extension", StringComparison.OrdinalIgnoreCase) || string.Equals(record.ClassGuid, "{e2f84ce7-8efa-411c-aa69-97454ca4cb57}", StringComparison.OrdinalIgnoreCase)); }
+        public static string RepositoryId(OfflineRepo repo, InfRecord record)
+        {
+            if (!IsExtension(record)) return "";
+            Guid id;
+            if (Guid.TryParse(record.ExtensionId, out id)) return id.ToString("B");
+            string cached;
+            if (Ids.TryGetValue(record.ContentHash, out cached)) return cached;
+            cached = ReadRepositoryRecord(repo, record).ExtensionId ?? "";
+            Ids.TryAdd(record.ContentHash, cached);
+            return cached;
+        }
+        private static InfRecord ReadRepositoryRecord(OfflineRepo repo, InfRecord record)
+        {
+            var entry = repo.EntryForRelative(record.Path);
+            if (entry == null) throw new InvalidDataException("仓库 INF 元数据不存在：" + record.Path);
+            InfRecord actual;
+            string local = LanSecurity.SafeAbsolute(repo.RepoRoot, entry.RelativePath);
+            if (local != null && File.Exists(local)) actual = InfParser.Parse(local, entry.SourceName);
+            else
+            {
+                string relative = string.IsNullOrEmpty(entry.PackageRoot) ? Path.GetFileName(entry.RelativePath) : entry.RelativePath.Substring(entry.PackageRoot.Length + 1);
+                using (var zip = ZipFile.OpenRead(OfflineRepoGenerator.DownloadArchivePath(repo.RepoRoot, entry)))
+                {
+                    var member = zip.Entries.FirstOrDefault(e => string.Equals(e.FullName.Replace('\\', '/'), relative.Replace('\\', '/'), StringComparison.OrdinalIgnoreCase));
+                    if (member == null || member.Length > 16 * 1024 * 1024) throw new InvalidDataException("INF 归档内容缺失或过大：" + entry.RelativePath);
+                    using (var input = member.Open()) using (var bytes = new MemoryStream()) { input.CopyTo(bytes); actual = InfParser.ParseBytes(bytes.ToArray(), local, entry.SourceName); }
+                }
+            }
+            if (!string.Equals(actual.ContentHash, entry.ContentHash, StringComparison.OrdinalIgnoreCase)) throw new InvalidDataException("INF 哈希校验失败：" + entry.RelativePath);
+            actual.Path = record.Path; actual.SourceName = record.SourceName;
+            return actual;
+        }
+        public static bool Satisfied(LanCandidateDto candidate, D device, OsTarget target, DriverScanFiles files = null)
+        {
+            if (candidate == null || !candidate.IsExtension || device == null) return false;
+            var paths = CurrentDriverState.ExtensionInfPaths(device.Id);
+            if (paths == null) return false;
+            foreach (string path in paths)
+            {
+                try
+                {
+                    var actual = files == null ? InfParser.Parse(path, "installed") : files.Parse(path, "installed");
+                    if (!IsExtension(actual) || !string.Equals(actual.ExtensionId, candidate.ExtensionId, StringComparison.OrdinalIgnoreCase)) continue;
+                    if (!InfApplicability.Evaluate(actual, target, device.H, device.K).Applicable) continue;
+                    if (string.Equals(actual.ContentHash, candidate.ContentHash, StringComparison.OrdinalIgnoreCase)) return true;
+                    DateTime date;
+                    InfParser.TryParseDriverDate(candidate.DriverVerDate, out date);
+                    if (actual.Date() > date || (actual.Date() == date && !DriverVersion.IsNewer(candidate.DriverVerVersion, actual.DriverVerVersion))) return true;
+                }
+                catch (IOException) { }
+                catch (UnauthorizedAccessException) { }
+            }
+            return false;
+        }
+        public static bool HasAppliedLineage(LanCandidateDto candidate, D device)
+        {
+            if (device == null) return false;
+            foreach (string path in CurrentDriverState.ExtensionInfPaths(device.Id) ?? new List<string>())
+                try { if (string.Equals(InfParser.Parse(path, "installed").ExtensionId, candidate.ExtensionId, StringComparison.OrdinalIgnoreCase)) return true; }
+                catch (IOException) { } catch (UnauthorizedAccessException) { }
+            return false;
+        }
     }
 
     public sealed class LanReportResponse
@@ -182,6 +289,7 @@ namespace UDA
 
     public sealed class LanHealth
     {
+        public string RepositoryUpdatedUtc = "";
         public int Protocol = LanProtocol.Version;
         public string ServerVersion = LanProtocol.ServerVersion;
         public bool RepoLoaded;
@@ -196,9 +304,11 @@ namespace UDA
         public bool ListenerRunning;
         public int WatcherCount;
         public bool ImportRunning;
+        public bool MaintenanceRunning;
         public string ImportStage = "";
         public string LastError = "";
         public string LastErrorUtc = "";
+        public string RepoRetryUtc = "";
     }
 
     /// <summary>
@@ -278,7 +388,7 @@ namespace UDA
     public static class LanProtocol
     {
         public const int Version = 2;
-        public const string ServerVersion = "5.3.9";
+        public const string ServerVersion = "5.3.45";
         public const string HeaderProtocol = "X-UDA-Protocol";
         public const string HeaderToken = "X-UDA-Token";
         public const string HeaderInfHash = "X-UDA-Inf-Hash";
@@ -344,7 +454,13 @@ namespace UDA
                 }
             }
             Decision decision = Classify(d, cand.DriverVerVersion);
-            if (decision == Decision.Skip)
+            if (cand.IsExtension)
+            {
+                Guid id;
+                if (d == null || !Guid.TryParse(cand.ExtensionId, out id) || target == null || target.MajorVersion < 10) return "扩展驱动缺少有效目标或 ExtensionId";
+                return LanExtensionPackages.Satisfied(cand, d, target) ? "该扩展的同版或更高优先版本已应用于设备" : null;
+            }
+            if (decision == Decision.Skip && !cand.UserSelectedVersion)
             {
                 string current = d != null ? d.Version : "";
                 return "设备当前驱动已是同版或更高版本 / device already runs the same or a newer driver" +
@@ -608,6 +724,7 @@ namespace UDA
     public sealed class LanServerConfig
     {
         [ScriptIgnore] public Action<Action> StorageMaintenance;
+        [ScriptIgnore] public Action<Action> CatalogMetadataMutation;
         [ScriptIgnore] public Action<string, MachineDriverPackage, Action<string>> ImportMachinePackage;
         [ScriptIgnore] public Func<IList<ClusterPeer>, bool> UpdateClusterPeers;
         [ScriptIgnore] public Func<List<ClusterPeer>> ReadClusterPeers;
@@ -640,7 +757,7 @@ namespace UDA
         public int BackoffInitialMs = 100;
         public string StagingDir = "";         // client-controlled download staging root
         public bool Deploy, WhatIf, Force;
-        public int InstallTimeoutSeconds = 120;
+        public int InstallTimeoutSeconds = 600;
         public bool DedupeByContent = true, VerifySignature = true;
     }
 
@@ -748,8 +865,41 @@ namespace UDA
         private readonly SemaphoreSlim _requestSlots = new SemaphoreSlim(256, 256);
         private readonly ReaderWriterLockSlim _packageAccess = new ReaderWriterLockSlim();
 
-        private T MutateRepository<T>(Func<T> action, IProgress<string> progress = null, Action rollback = null, bool expandArchives = true)
+        private T MutateRepository<T>(Func<string, T> action, IProgress<string> progress = null, Action<string> rollback = null, bool expandArchives = true)
         {
+            if (ServerStorage.Config(_config.RepoRoot).DatabaseOnly)
+            {
+                lock (_maintenanceGate)
+                {
+                    _onlineMaintenance = true;
+                    try
+                    {
+                        _cts.Token.ThrowIfCancellationRequested();
+                        foreach (var model in MachineDriverPackages.Load(_config.RepoRoot)) MachineDriverPackages.Archive(_config.RepoRoot, model.SourceName, model.PackagePrefix, false);
+                        using (var work = new ServerStorage.OnlineWorkspace(_config.RepoRoot))
+                        {
+                            if (progress != null) progress.Report("在线维护：后台准备，已发布驱动继续提供服务");
+                            if (expandArchives) DatabaseArchiveRepository.ExpandForMaintenance(work.Root, progress);
+                            T result = action(work.Root);
+                            DatabaseArchiveRepository.Compact(work.Root, progress);
+                            var catalog = OfflineRepoGenerator.TryLoadManifest(work.Root);
+                            var prepared = PreparePublication(OfflineRepo.FromCatalog(_config.RepoRoot, catalog), work.Root);
+                            var retired = RetireCurrentDownloads(prepared);
+                            if (TestOnlineBeforeCommit != null) TestOnlineBeforeCommit();
+                            _cts.Token.ThrowIfCancellationRequested();
+                            work.Commit(retired);
+                            foreach (var ticket in retired) _retiredDownloads[DownloadKey(ticket.Path, ticket.Package)] = ticket;
+                            lock (_repoLock) { _repo = prepared.Repo; _publication = prepared; _archiveSetReady = true; }
+                            lock (_cacheLock) _cache.Clear();
+                            if (progress != null) progress.Report("在线维护：新目录已切换，旧扫描下载保留7天");
+                            try { ServerStorage.CleanupRetiredDownloads(_config.RepoRoot, catalog.Entries.Select(e => Path.GetFileName(OfflineRepoGenerator.DownloadArchivePath(_config.RepoRoot, e))).Concat(prepared.ModelFiles.Values)); }
+                            catch (Exception cleanup) { ServiceEventLog.Write("warning", "在线归档延后清理：" + cleanup.GetType().Name); }
+                            return result;
+                        }
+                    }
+                    finally { _onlineMaintenance = false; }
+                }
+            }
             if (progress != null) progress.Report("阶段：等待仓库维护锁");
             while (!_packageAccess.TryEnterWriteLock(200)) _cts.Token.ThrowIfCancellationRequested();
             try {
@@ -758,7 +908,7 @@ namespace UDA
                 foreach (var policy in MachineDriverPackages.Load(_config.RepoRoot)) MachineDriverPackages.Archive(_config.RepoRoot, policy.SourceName, policy.PackagePrefix, false);
                 if (expandArchives) DatabaseArchiveRepository.ExpandForMaintenance(_config.RepoRoot, progress);
                 else if (progress != null) progress.Report("追加增量：保留旧归档，仅处理本次输入目录");
-                T result = action();
+                T result = action(_config.RepoRoot);
                 if (ServerStorage.Config(_config.RepoRoot).DatabaseOnly) { if (progress != null) progress.Report("阶段：核验归档并提交数据库"); DatabaseArchiveRepository.Compact(_config.RepoRoot, progress); }
                 if (progress != null) progress.Report("阶段：热加载仓库");
                 var expected = OfflineRepoGenerator.TryLoadManifest(_config.RepoRoot); LoadRepo();
@@ -767,11 +917,52 @@ namespace UDA
             }
             catch (Exception failure)
             {
-                try { if (rollback != null) rollback(); }
+                try { if (rollback != null) rollback(_config.RepoRoot); }
                 catch (Exception restore) { throw new AggregateException("导入失败，恢复原仓库清单也未完成，需要管理员核对", failure, restore); }
                 throw;
             }
             finally { _packageAccess.ExitWriteLock(); }
+        }
+        private readonly object _maintenanceGate = new object();
+        private volatile bool _onlineMaintenance;
+        internal Action TestOnlineBeforeCommit;
+        private sealed class Publication
+        {
+            public OfflineRepo Repo;
+            public List<MachineDriverPackage> Models;
+            public Dictionary<string, string> ModelFiles;
+        }
+        private Publication _publication;
+        private readonly System.Collections.Concurrent.ConcurrentDictionary<string, RetiredDriverDownload> _retiredDownloads = new System.Collections.Concurrent.ConcurrentDictionary<string, RetiredDriverDownload>(StringComparer.OrdinalIgnoreCase);
+        private static string DownloadKey(string path, string package) { return path + "|" + (package ?? ""); }
+        private Publication PreparePublication(OfflineRepo repo, string metadataRoot)
+        {
+            var models = MachineDriverPackages.Load(metadataRoot);
+            var files = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var model in models)
+                files[model.SourceName + "|" + model.PackagePrefix] = Path.GetFileName(MachineDriverPackages.Archive(metadataRoot, model.SourceName, model.PackagePrefix, false));
+            return new Publication { Repo = repo, Models = models, ModelFiles = files };
+        }
+        private List<RetiredDriverDownload> RetireCurrentDownloads(Publication next)
+        {
+            Publication published; lock (_repoLock) published = _publication;
+            var tickets = new List<RetiredDriverDownload>(); if (published == null) return tickets;
+            string expiry = DateTime.UtcNow.AddDays(7).ToString("o");
+            foreach (var entry in published.Repo.Manifest.Entries)
+            {
+                tickets.Add(new RetiredDriverDownload { Path = entry.RelativePath, Hash = entry.ContentHash, Archive = Path.GetFileName(OfflineRepoGenerator.DownloadArchivePath(_config.RepoRoot, entry)), ExpiresUtc = expiry });
+                foreach (var model in published.Models.Where(m => MachineDriverPackages.Contains(entry, m)))
+                {
+                    string file = published.ModelFiles[model.SourceName + "|" + model.PackagePrefix];
+                    tickets.Add(new RetiredDriverDownload { Path = entry.RelativePath, Hash = entry.ContentHash, Archive = file, Package = Path.GetFileNameWithoutExtension(file), ExpiresUtc = expiry });
+                }
+            }
+            return tickets.Where(ticket => {
+                var entry = next.Repo.EntryForRelative(ticket.Path);
+                if (entry == null || entry.ContentHash != ticket.Hash) return true;
+                if (ticket.Package.Length == 0) return Path.GetFileName(OfflineRepoGenerator.DownloadArchivePath(_config.RepoRoot, entry)) != ticket.Archive;
+                return !next.Models.Any(model => MachineDriverPackages.Contains(entry, model) && next.ModelFiles[model.SourceName + "|" + model.PackagePrefix] == ticket.Archive);
+            }).ToList();
         }
         private volatile bool _listenerRunning;
         private int _activeDownloads;
@@ -784,6 +975,7 @@ namespace UDA
         private readonly Dictionary<string, LanReportResponse> _cache = new Dictionary<string, LanReportResponse>(StringComparer.OrdinalIgnoreCase);
         private const int CacheCap = 10000;
         private readonly WebAdminController _webAdmin;
+        private readonly AiDriverTaskRunner _aiTasks;
         private readonly ClusterRouter _clusterRouter;
         private readonly object _importLock = new object();
         private bool _importRunning;
@@ -802,6 +994,9 @@ namespace UDA
         private readonly List<FileSystemWatcher> _sourceWatchers = new List<FileSystemWatcher>();
         private Timer _watchDebounceTimer;
         private Timer _storageRecovery;
+        private Timer _repoRecovery;
+        private DateTime _repoRetryUtc = DateTime.MinValue;
+        private int _repoRetrySeconds = 5;
         private bool _watchUpdatePending;
         // Explicit source roots waiting for an incremental merge. Unlike the old boolean-only
         // queue, retaining the roots prevents a queued add/change from falling back to a full
@@ -844,34 +1039,42 @@ namespace UDA
                 if (progress != null) progress.Report("阶段：检查上传完整性");
                 WebAdminController.ValidateUploadedSource(_config.RepoRoot, source);
                 string oldManifest = null, oldPolicies = null;
-                MutateRepository(() => {
-                    oldManifest = ServerStorage.Read(_config.RepoRoot, "repo.manifest.json"); oldPolicies = ServerStorage.Read(_config.RepoRoot, "repo.machine-packages.json");
+                MutateRepository(workRoot => {
+                    oldManifest = ServerStorage.Read(workRoot, "repo.manifest.json"); oldPolicies = ServerStorage.Read(workRoot, "repo.machine-packages.json");
                     string dedicated = "Machine-" + Guid.NewGuid().ToString("N");
                     if (progress != null) progress.Report("阶段：导入机型驱动文件");
                     var generator = new OfflineRepoGenerator(ImportSignatureVerifier ?? new WinTrustSignatureVerifier(), _logger);
-                    var report = generator.AppendOrganizedSource(_config.RepoRoot, source, _cts.Token, progress, dedicated);
+                    var report = generator.AppendOrganizedSource(workRoot, source, _cts.Token, progress, dedicated);
                     if (report.Added == 0) throw new InvalidDataException("没有可发布的 INF：请检查文件夹是否包含完整 INF 驱动，以及这些驱动是否已被管理员取消发布。上传原件已保留。");
                     if (progress != null) progress.Report("阶段：机型驱动已入库（新增 " + report.Added + " 个 INF）");
                     if (progress != null) progress.Report("阶段：生成下载压缩包");
-                    OfflineRepoGenerator.PrepareDownloadPackages(_config.RepoRoot, progress);
+                    OfflineRepoGenerator.PrepareDownloadPackages(workRoot, progress);
                     policy.SourceName = dedicated; policy.PackagePrefix = "";
-                    var policies = MachineDriverPackages.Load(_config.RepoRoot);
+                    var policies = MachineDriverPackages.Load(workRoot);
                     policies.RemoveAll(p => MachineDriverPackages.SameSystemMapping(p, policy));
                     policies.Add(policy); if (progress != null) progress.Report("阶段：生成机型整包与保存对应关系");
-                    MachineDriverPackages.Save(_config.RepoRoot, policies, progress); return true;
-                }, progress, () => {
+                    MachineDriverPackages.Save(workRoot, policies, progress); return true;
+                }, progress, workRoot => {
                     if (oldManifest == null) return;
                     if (progress != null) progress.Report("阶段：恢复原仓库清单和机型对应关系");
-                    ServerStorage.Write(_config.RepoRoot, "repo.manifest.json", oldManifest, false);
-                    if (oldPolicies == null) ServerStorage.Delete(_config.RepoRoot, "repo.machine-packages.json"); else ServerStorage.Write(_config.RepoRoot, "repo.machine-packages.json", oldPolicies, false);
-                    string index = Path.Combine(_config.RepoRoot, "repo.udadb");
-                    if (ServerStorage.Config(_config.RepoRoot).DatabaseOnly && File.Exists(index)) File.Delete(index);
+                    ServerStorage.Write(workRoot, "repo.manifest.json", oldManifest, false);
+                    if (oldPolicies == null) ServerStorage.Delete(workRoot, "repo.machine-packages.json"); else ServerStorage.Write(workRoot, "repo.machine-packages.json", oldPolicies, false);
+                    string index = Path.Combine(workRoot, "repo.udadb");
+                    if (ServerStorage.Config(workRoot).DatabaseOnly && File.Exists(index)) File.Delete(index);
                     LoadRepo();
                 }, false);
                 if (progress != null) progress.Report("阶段：清理已消费上传暂存");
                 FinalizeUploadedSource(source);
             };
-            _config.StorageMaintenance = action => { _packageAccess.EnterWriteLock(); try { action(); LoadRepo(); lock (_cacheLock) _cache.Clear(); } finally { _packageAccess.ExitWriteLock(); } };
+            _config.StorageMaintenance = action => { lock (_maintenanceGate) { _packageAccess.EnterWriteLock(); try { action(); LoadRepo(); lock (_cacheLock) _cache.Clear(); } finally { _packageAccess.ExitWriteLock(); } } };
+            _config.CatalogMetadataMutation = action => {
+                lock (_maintenanceGate)
+                {
+                    action(); OfflineRepo current; lock (_repoLock) current = _repo;
+                    if (current != null) { var prepared = PreparePublication(current, _config.RepoRoot); lock (_repoLock) _publication = prepared; }
+                    lock (_cacheLock) _cache.Clear();
+                }
+            };
             _clusterRouter = new ClusterRouter(_config.RepoRoot, _config.AdvertiseUrl, _config.Token,
                 delegate { lock (_repoLock) return _archiveSetReady && _repo != null && _repo.Manifest != null ? _repo.Manifest.IntegrityHash : ""; },
                 delegate { return Math.Max(0, Volatile.Read(ref _activeDownloads)); });
@@ -880,6 +1083,7 @@ namespace UDA
             _config.ReadClusterStatus = () => _clusterRouter.Status();
             if (!string.IsNullOrWhiteSpace(_config.AdminCredentialsFile)) LoadPersistedImportSources();
             _webAdmin = new WebAdminController(_config, delegate { lock (_repoLock) return _repo; }, RepoLoadingStatus);
+            _aiTasks = new AiDriverTaskRunner(_config.RepoRoot, delegate { lock (_repoLock) return _repo; }, _cts.Token);
         }
 
         /// <summary>Status text shown by the admin console while the repository is still loading.
@@ -949,37 +1153,26 @@ namespace UDA
 
         public void LoadRepo()
         {
-            lock (_repoLock)
+            try
             {
-                try
+                if (!string.IsNullOrEmpty(_config.RepoRoot) && (File.Exists(Path.Combine(_config.RepoRoot, "repo.manifest.json")) || ServerStorage.Config(_config.RepoRoot).Enabled))
                 {
-                    if (!string.IsNullOrEmpty(_config.RepoRoot) && (File.Exists(Path.Combine(_config.RepoRoot, "repo.manifest.json")) || ServerStorage.Config(_config.RepoRoot).Enabled))
-                    {
-                        OfflineRepo opened = TestRepoOpenOverride != null ? TestRepoOpenOverride(_config.RepoRoot) : OfflineRepo.Open(_config.RepoRoot, _logger);
-                        bool archivesReady = false;
-                        try
-                        {
-                            int prepared = OfflineRepoGenerator.PrepareDownloadPackages(_config.RepoRoot, null);
-                            archivesReady = true;
-                            if (prepared > 0 && _logger != null) _logger.W("[INFO] 已为新驱动预生成独立下载包 / prebuilt " + prepared + " driver archives");
-                        }
-                        catch (Exception archiveError)
-                        {
-                            if (_logger != null) _logger.W("[ERROR] 独立驱动包未能就绪 / driver archive preparation failed: " + archiveError.Message);
-                            _archiveSetReady = false;
-                            throw;
-                        }
-                        _repo = opened;   // swap only after a successful open: a failed reload keeps the previous usable repo
-                        _archiveSetReady = archivesReady;
-                    }
-                    else { _repo = null; _archiveSetReady = false; }
+                    var opened = TestRepoOpenOverride != null ? TestRepoOpenOverride(_config.RepoRoot) : OfflineRepo.Open(_config.RepoRoot, _logger);
+                    OfflineRepoGenerator.PrepareDownloadPackages(_config.RepoRoot, null);
+                    var prepared = PreparePublication(opened, _config.RepoRoot);
+                    if (ServerStorage.Config(_config.RepoRoot).Enabled && _retiredDownloads.Count == 0)
+                        foreach (var row in ServerStorage.Documents(_config.RepoRoot, "repo.download-history."))
+                            foreach (var ticket in new JavaScriptSerializer { MaxJsonLength = int.MaxValue }.Deserialize<List<RetiredDriverDownload>>(row.Value))
+                                if (string.CompareOrdinal(ticket.ExpiresUtc, DateTime.UtcNow.ToString("o")) > 0)
+                                    _retiredDownloads.AddOrUpdate(DownloadKey(ticket.Path, ticket.Package), ticket, (key, existing) => string.CompareOrdinal(existing.ExpiresUtc, ticket.ExpiresUtc) >= 0 ? existing : ticket);
+                    lock (_repoLock) { _repo = opened; _publication = prepared; _archiveSetReady = true; }
                 }
-                catch (Exception ex)
-                {
-                    // A single failed reload must never take the process down nor blank the serving repo.
-                    RecordError("repo load failed (previous repo kept / 仓库加载失败，保留上一份可用仓库): " + ex.Message);
-                    if (_logger != null) _logger.W("[ERROR] 仓库加载失败，保留上一份可用仓库 / repo load failed, keeping previous repo: " + ex.Message);
-                }
+                else { lock (_repoLock) { _repo = null; _publication = null; _archiveSetReady = false; } }
+            }
+            catch (Exception ex)
+            {
+                RecordError("repo load failed (previous repo kept / 仓库加载失败，保留上一份可用仓库): " + ex.Message);
+                if (_logger != null) _logger.W("[ERROR] 仓库加载失败，保留上一份可用仓库: " + ex.Message);
             }
             lock (_cacheLock) _cache.Clear();
         }
@@ -1036,20 +1229,35 @@ namespace UDA
             _loop = new Thread(Loop) { IsBackground = true, Name = "LanDriverServer" };
             _loop.Start();
             _storageRecovery = ServerStorage.StartRecovery(_config.RepoRoot);
+            _aiTasks.Start();
+            _repoRecovery = new Timer(delegate { RetryRepository(); }, null, 1000, 1000);
             BeginRepoInit();
             ServiceEventLog.Write("event", "LAN 服务已启动 / LAN server listening on port " + _config.Port + " (repo=" + (_config.RepoRoot ?? "") + ", token=" + (string.IsNullOrEmpty(_config.Token) ? "off" : "on") + ", watchers=" + WatcherCount + ")");
             if (_logger != null) _logger.W("[INFO] LAN 服务已启动 / LAN server listening on port " + _config.Port + " (repo=" + (_config.RepoRoot ?? "") + ", token=" + (string.IsNullOrEmpty(_config.Token) ? "off" : "on") + ")");
         }
 
-        /// <summary>Queue the one background repo-init job (single-flight with imports/dedupe). Called
-        /// once from Start(); a concurrent mutation job would mean Start ran twice, which cannot happen.</summary>
+        // Startup recovery only reopens the persisted index; it never rebuilds the driver library.
+        private void RetryRepository()
+        {
+            // Do not take _repoLock here: an ongoing large load holds it for its entire read.
+            // Timer callbacks must stay nonblocking rather than queue up waiting for that load.
+            if (IsStopping) return;
+            lock (_importLock)
+            {
+                if (IsStopping || _importRunning || _repoRetryUtc == DateTime.MinValue || DateTime.UtcNow < _repoRetryUtc) return;
+                _repoRetryUtc = DateTime.MinValue;
+                BeginRepoInit();
+            }
+        }
+
+        /// <summary>Queue a background repo load, single-flight with imports/dedupe.</summary>
         private void BeginRepoInit()
         {
             try
             {
                 lock (_importLock)
                 {
-                    if (_importRunning) return;
+                    if (IsStopping || _importRunning) return;
                     _importRunning = true;
                     _importStage = "repo-loading";
                     _importMessage = "正在加载驱动仓库，管理后台可正常访问";
@@ -1061,8 +1269,7 @@ namespace UDA
             }
             catch (Exception ex)
             {
-                RecordError("repo init scheduling failed: " + ex.Message);
-                lock (_importLock) { _importRunning = false; _importStage = "failed"; _importError = ex.Message; _importFinishedUtc = DateTime.UtcNow; }
+                FinishRepoInit("failed", "仓库加载任务启动失败", ex.Message);
             }
         }
 
@@ -1076,17 +1283,19 @@ namespace UDA
             try
             {
                 if (IsStopping) { FinishRepoInit("completed", "服务已停止，跳过仓库加载", ""); return; }
-                while (!_packageAccess.TryEnterWriteLock(200)) { if (IsStopping) return; }
-                ownsWriteLock = true;
+                bool databaseOnly = ServerStorage.Config(_config.RepoRoot).DatabaseOnly;
+                if (!databaseOnly) { while (!_packageAccess.TryEnterWriteLock(200)) { if (IsStopping) return; } ownsWriteLock = true; }
+                if (databaseOnly) ServerStorage.RecoverOnlineWorkspaces(_config.RepoRoot);
                 // SMB authentication and unavailable shares may be slow; never do this before
                 // SCM OnStart returns or before the HTTP listener is available.
                 SmbSourceCredentials.Restore(_config, warning => { if (_logger != null) _logger.W("[WARN] " + warning); });
+                if (!string.IsNullOrWhiteSpace(_config.AdminCredentialsFile)) LoadPersistedImportSources();
                 StartSourceWatchers();
                 lock (_importLock) { _importMessage = "正在加载驱动仓库（大型或旧索引仓库可能需要较长时间）"; }
-                LoadRepo();
+                if (databaseOnly) { lock (_maintenanceGate) LoadRepo(); } else LoadRepo();
                 OfflineRepo repo; lock (_repoLock) repo = _repo;
                 bool manifestMissing = string.IsNullOrEmpty(_config.RepoRoot) ||
-                    !File.Exists(Path.Combine(_config.RepoRoot, "repo.manifest.json"));
+                    (!ServerStorage.Config(_config.RepoRoot).Enabled && !File.Exists(Path.Combine(_config.RepoRoot, "repo.manifest.json")));
                 if (repo == null && manifestMissing)
                 { FinishRepoInit("completed", "未配置驱动仓库 / no repository configured", ""); return; }
                 if (repo == null)
@@ -1120,6 +1329,8 @@ namespace UDA
                 _importError = error ?? "";
                 _importFinishedUtc = DateTime.UtcNow;
                 _importRunning = false;
+                _repoRetryUtc = stage == "failed" && !IsStopping ? DateTime.UtcNow.AddSeconds(_repoRetrySeconds) : DateTime.MinValue;
+                _repoRetrySeconds = stage == "failed" ? Math.Min(60, _repoRetrySeconds * 2) : 5;
             }
             if (stage == "failed")
             {
@@ -1212,6 +1423,8 @@ namespace UDA
 
         public void Stop()
         {
+            _aiTasks.Dispose();
+            if (_repoRecovery != null) { _repoRecovery.Dispose(); _repoRecovery = null; }
             if (_storageRecovery != null) { _storageRecovery.Dispose(); _storageRecovery = null; }
             if (!IsStopping)
             {
@@ -1232,7 +1445,7 @@ namespace UDA
             DateTime importDeadline = DateTime.UtcNow + TimeSpan.FromSeconds(10);
             while (DateTime.UtcNow < importDeadline)
             {
-                bool running = ImportRunningNow;
+                bool running = ImportRunningNow || _aiTasks.IsRunning;
                 if (!running) break;
                 Thread.Sleep(50);
             }
@@ -1475,6 +1688,30 @@ namespace UDA
             if (path == "/api/admin/duplicates" && method == "GET") { HandleDuplicates(ctx); return; }
             if (path == "/api/admin/dedupe" && method == "POST") { HandleDedupe(ctx); return; }
             if (path == "/api/admin/organize" && method == "POST") { HandleOrganize(ctx); return; }
+            if (path == "/api/admin/ai/status" && method == "GET")
+            {
+                if (!_webAdmin.IsAuthenticated(ctx)) { SafeRespond(ctx, 401, "admin login required"); return; }
+                RespondJson(ctx, 200, _aiTasks.Status()); return;
+            }
+            if (path == "/api/admin/ai/schedule")
+            {
+                if (!_webAdmin.IsAuthenticated(ctx)) { SafeRespond(ctx, 401, "admin login required"); return; }
+                try
+                {
+                    if (method == "POST")
+                    {
+                        if (!IsRepoMutatorAuthorized(ctx)) return;
+                        string body = ReadBody(ctx); if (body == null) return;
+                        _aiTasks.SaveSchedule(new JavaScriptSerializer().Deserialize<AiAutoTaskSettings>(body));
+                    }
+                    else if (method != "GET") { SafeRespond(ctx, 405, "GET or POST required"); return; }
+                    RespondJson(ctx, 200, _aiTasks.ScheduleStatus());
+                }
+                catch (ArgumentException ex) { SafeRespond(ctx, 400, ex.Message); }
+                catch (InvalidOperationException ex) { SafeRespond(ctx, 409, ex.Message); }
+                catch (Exception) { SafeRespond(ctx, 500, "自动计划读取或保存失败，请检查数据库连接和日志"); }
+                return;
+            }
             if (path == "/api/admin/ai/tasks" && method == "POST") { HandleAiTask(ctx); return; }
             if (path == "/api/admin/drivers/delete" && method == "POST") { HandleDeleteDrivers(ctx); return; }
             if (_webAdmin.TryHandle(ctx)) return;
@@ -1504,13 +1741,16 @@ namespace UDA
                     TokenRequired = !string.IsNullOrEmpty(_config.Token),
                     ListenerRunning = IsListening,
                     WatcherCount = WatcherCount,
-                    ImportRunning = ImportRunningNow && !_catalogDeleteRunning,
+                    ImportRunning = ImportRunningNow && !_catalogDeleteRunning && !(RepoLoaded && ServerStorage.Config(_config.RepoRoot).DatabaseOnly),
+                    MaintenanceRunning = ImportRunningNow || _onlineMaintenance,
                     ImportStage = CurrentImportStage
                 };
+                lock (_repoLock) health.RepositoryUpdatedUtc = _repo != null ? _repo.Manifest.CreatedAt : "";
                 string lastError, lastErrorUtc;
                 GetLastError(out lastError, out lastErrorUtc);
                 health.LastError = lastError;
                 health.LastErrorUtc = lastErrorUtc;
+                lock (_importLock) health.RepoRetryUtc = _repoRetryUtc == DateTime.MinValue ? "" : _repoRetryUtc.ToString("o", CultureInfo.InvariantCulture);
                 RespondJson(ctx, 200, health);
             }
             catch (Exception ex) { SafeRespond(ctx, 500, "health error: " + ex.Message); }
@@ -1537,8 +1777,9 @@ namespace UDA
             catch { SafeRespond(ctx, 400, "invalid report JSON"); return; }
             if (req == null) { SafeRespond(ctx, 400, "empty report"); return; }
             if (req.Devices == null) req.Devices = new List<LanDeviceDto>();
-            string policyCacheKey = req.RequestId + "|policy:" + DriverReleasePolicies.Revision + "|machine:" + MachineDriverPackages.Revision + "|" + req.MachineManufacturer + "|" + req.MachineModel + "|" + req.OsArchitecture + "|" + req.OsMajorVersion + "." + req.OsMinorVersion + "." + req.OsBuildNumber;
+            string policyCacheKey = req.RequestId + "|oem:" + DriverOemBrands.Revision + "|policy:" + DriverReleasePolicies.Revision + "|machine:" + MachineDriverPackages.Revision + "|" + req.MachineManufacturer + "|" + req.MachineModel + "|" + req.OsArchitecture + "|" + req.OsMajorVersion + "." + req.OsMinorVersion + "." + req.OsBuildNumber;
 
+            policyCacheKey += "|extensions:" + req.SupportsExtensionPackages;
             // Idempotency: a repeated RequestId returns the cached response without re-matching.
             if (!string.IsNullOrEmpty(req.RequestId))
             {
@@ -1547,29 +1788,73 @@ namespace UDA
             }
 
             var resp = new LanReportResponse { Protocol = LanProtocol.Version, ServerVersion = LanProtocol.ServerVersion };
-            OfflineRepo repo; lock (_repoLock) repo = _repo;
-            if (repo == null) { resp.Ok = false; resp.Error = "repo not loaded"; RespondJson(ctx, 503, resp); return; }
+            Publication published; OfflineRepo repo; lock (_repoLock) { repo = _repo; published = _publication; }
+            if (repo == null) { resp.Ok = false; lock (_importLock) resp.Error = "驱动仓库尚未就绪 / repo not loaded: " + _importError + (_repoRetryUtc == DateTime.MinValue ? "" : "；服务端将自动重试加载"); RespondJson(ctx, 503, resp); return; }
             var osTarget = new OsTarget { Architecture = string.IsNullOrEmpty(req.OsArchitecture) ? _config.OsArchitecture : req.OsArchitecture, MajorVersion = req.OsMajorVersion <= 0 ? _config.OsMajorVersion : req.OsMajorVersion, MinorVersion = req.OsMinorVersion, BuildNumber = Math.Max(0, req.OsBuildNumber) };
             MachineDriverPackages.Observe(repo.RepoRoot, req, osTarget);
-            var machinePolicies = MachineDriverPackages.Load(repo.RepoRoot);
+            var machinePolicies = published.Models;
             MachineDriverPackage machinePackage;
             try { machinePackage = MachineDriverPackages.Select(machinePolicies, req.MachineManufacturer, req.MachineModel, osTarget); }
             catch (Exception ex) { resp.Ok = false; resp.Error = ex.Message; RespondJson(ctx, 409, resp); return; }
             var scopedRecords = repo.Records.Where(r => { var e = repo.EntryForRelative(r.Path); return e != null && (machinePackage != null ? MachineDriverPackages.Contains(e, machinePackage) : !e.SourceName.StartsWith("Machine-", StringComparison.OrdinalIgnoreCase) && !machinePolicies.Any(p => MachineDriverPackages.Contains(e, p))); }).ToList();
             if (machinePackage != null && scopedRecords.Count == 0) { resp.Ok = false; resp.Error = "专用机型整包已不存在，禁止回退通用驱动"; RespondJson(ctx, 409, resp); return; }
-            string machineArchive = machinePackage == null ? null : MachineDriverPackages.Archive(repo.RepoRoot, machinePackage.SourceName, machinePackage.PackagePrefix);
+            string machineArchive = machinePackage == null ? null : Path.Combine(repo.RepoRoot, ".uda-downloads", published.ModelFiles[machinePackage.SourceName + "|" + machinePackage.PackagePrefix]);
             var ranker = new MatchRanker(scopedRecords, new string[0]);
             // The fallback path must reuse the same inverted index. Rebuilding a MatchRanker for
             // every unmatched device is O(devices * repository size) and made a real 210-device
             // report exceed the old eight-second client timeout on large repositories.
             var unfilteredRanker = ranker;
             var releasePolicies = DriverReleasePolicies.Load(repo.RepoRoot);
+            var oemBrands = DriverOemBrands.Load(repo.RepoRoot); string machineBrand = DriverOemBrands.Normalize(req.MachineManufacturer);
+            var brandScores = new Dictionary<InfRecord, int>();
+            Func<MatchCandidate, int> brandAffinity = c => { int score; if (!brandScores.TryGetValue(c.Record, out score)) brandScores[c.Record] = score = DriverOemBrands.Affinity(machineBrand, DriverOemBrands.Resolve(oemBrands, c.Record.ContentHash, c.Record.SourceName, c.Record.Path, c.Record.Manufacturer, c.Record.Provider)); return score; };
             foreach (var dev in req.Devices)
             {
                 var devHardware = dev.HardwareIds ?? new List<string>();
                 var devCompatible = dev.CompatibleIds ?? new List<string>();
                 HardwareIdNormalizer.AddSafeMatchingAliases(devHardware, devCompatible, dev.DeviceInstanceId);
                 var cands = ranker.Rank(devHardware, devCompatible, osTarget);
+                if (req.SupportsExtensionPackages && machinePackage == null && osTarget.MajorVersion >= 10)
+                {
+                    var extensions = new List<LanCandidateDto>();
+                    foreach (var extension in cands.Where(c => LanExtensionPackages.IsExtension(c.Record)))
+                    {
+                        try { extension.Record = LanExtensionPackages.CompleteRepositoryModels(repo, extension.Record); }
+                        catch (IOException ex) { if (_logger != null) _logger.W("[WARN] 配套扩展元数据不可读取：" + extension.Record.Path + " " + ex.Message); continue; }
+                        catch (UnauthorizedAccessException ex) { if (_logger != null) _logger.W("[WARN] 配套扩展元数据不可读取：" + extension.Record.Path + " " + ex.Message); continue; }
+                        var v = InfApplicability.Evaluate(extension.Record, osTarget, devHardware, devCompatible);
+                        if (!v.Applicable) continue;
+                        var e = repo.EntryForRelative(extension.Record.Path);
+                        if (e == null || string.Equals(e.SignatureStatus, "untrusted", StringComparison.OrdinalIgnoreCase)) continue;
+                        string brand = DriverOemBrands.Resolve(oemBrands, e.ContentHash, extension.Record.SourceName, extension.Record.Path, extension.Record.Manufacturer, extension.Record.Provider);
+                        if (machineBrand.Length > 0 && brand.Length > 0 && brand != machineBrand) continue;
+                        // A broad ACPI/codec ID plus unknown OEM provenance cannot prove that
+                        // another laptop's calibration applies. Prefer explicit subsystem targeting.
+
+                        string extensionId;
+                        try { extensionId = LanExtensionPackages.RepositoryId(repo, extension.Record); }
+                        catch (IOException ex) { if (_logger != null) _logger.W("[WARN] 无法读取配套扩展，基础驱动匹配继续：" + e.RelativePath + " " + ex.Message); continue; }
+                        catch (UnauthorizedAccessException ex) { if (_logger != null) _logger.W("[WARN] 配套扩展不可读取：" + e.RelativePath + " " + ex.Message); continue; }
+                        Guid parsedId; if (!Guid.TryParse(extensionId, out parsedId)) continue;
+                        if (!LanExtensionPackages.MatchesExtensionTarget(extension.Record, parsedId, v)) continue;
+                        if (v.MatchedInfId.IndexOf("SUBSYS_", StringComparison.OrdinalIgnoreCase) < 0 &&
+                            (machineBrand.Length == 0 || brand != machineBrand) && !LanExtensionPackages.IsIntelSgpcPlatformExtension(extension.Record, parsedId)) continue;
+                        extensions.Add(new LanCandidateDto {
+                            IsExtension = true, ExtensionId = parsedId.ToString("B"), DeviceInstanceId = dev.DeviceInstanceId,
+                            FriendlyName = (string.IsNullOrWhiteSpace(dev.FriendlyName) ? dev.DeviceInstanceId : dev.FriendlyName) + " · 配套扩展",
+                            InfRelativePath = e.RelativePath, PackageInfPath = string.IsNullOrEmpty(e.PackageRoot) ? Path.GetFileName(e.RelativePath) : e.RelativePath.Substring(e.PackageRoot.Length + 1),
+                            ContentHash = e.ContentHash, SignatureStatus = e.SignatureStatus, Provider = extension.Record.Provider,
+                            Class = extension.Record.Class, ClassGuid = extension.Record.ClassGuid, DriverVerDate = extension.Record.DriverVerDate, DriverVerVersion = extension.Record.DriverVerVersion,
+                            OemBrand = brand, MachineBrand = machineBrand, MatchedId = v.MatchedDeviceId, MatchedInfId = v.MatchedInfId,
+                            MatchLevel = (int)v.MatchLevel, Tier = extension.Tier, Decorations = new List<string>(extension.Record.Decorations), NeedInstall = true
+                        });
+                    }
+                    // ExtensionId is an independent lineage. Windows chooses date, then version;
+                    // neither the parent's version nor a different ExtensionId competes here.
+                    foreach (var lineage in extensions.GroupBy(c => c.ExtensionId, StringComparer.OrdinalIgnoreCase))
+                        resp.Candidates.Add(lineage.OrderByDescending(c => { DateTime date; InfParser.TryParseDriverDate(c.DriverVerDate, out date); return date; })
+                            .ThenByDescending(c => MatchRanker.VersionScore(c.DriverVerVersion)).First());
+                }
                 // Full applicability gate: EVERY ranked (device, INF) pair must pass
                 // InfApplicability.Evaluate against the reported OS (architecture, major version,
                 // build) AND the device's own hardware/compatible IDs. INFs that only passed the
@@ -1581,12 +1866,18 @@ namespace UDA
                 InfApplicabilityResult chosenVerdict = null;
                 InfApplicabilityResult firstRejection = null;
                 Func<MatchCandidate, bool> usable = cand => {
+                    try { cand.Record = LanExtensionPackages.CompleteRepositoryModels(repo, cand.Record); }
+                    catch (Exception ex) {
+                        if (!(ex is IOException) && !(ex is UnauthorizedAccessException)) throw;
+                        if (firstRejection == null) firstRejection = InfApplicabilityResult.Reject("RepositoryMetadataUnavailable", "候选 INF 元数据不可读取：" + cand.Record.Path + " " + ex.Message);
+                        return false;
+                    }
                     var rejected = CandidatePolicyGate(cand.Record, dev, osTarget);
                     var verdict = rejected ?? InfApplicability.Evaluate(cand.Record, osTarget, devHardware, devCompatible);
                     if (!verdict.Applicable && firstRejection == null) firstRejection = verdict;
                     return verdict.Applicable;
                 };
-                foreach (var cand in DriverReleasePolicies.Order(cands.Where(usable), releasePolicies, osTarget, devHardware.Concat(devCompatible)))
+                foreach (var cand in DriverReleasePolicies.Order(cands.Where(usable), releasePolicies, osTarget, devHardware.Concat(devCompatible), brandAffinity))
                 {
                     InfApplicabilityResult policyRejection = CandidatePolicyGate(cand.Record, dev, osTarget);
                     if (policyRejection != null)
@@ -1609,7 +1900,7 @@ namespace UDA
                     // so an applicable verdict here can only mean the first rank already missed
                     // the record for another reason and it is safe to offer it.
                     var unfiltered = unfilteredRanker.Rank(devHardware, devCompatible, null);
-                    foreach (var cand in DriverReleasePolicies.Order(unfiltered.Where(usable), releasePolicies, osTarget, devHardware.Concat(devCompatible)))
+                    foreach (var cand in DriverReleasePolicies.Order(unfiltered.Where(usable), releasePolicies, osTarget, devHardware.Concat(devCompatible), brandAffinity))
                     {
                         InfApplicabilityResult policyRejection = CandidatePolicyGate(cand.Record, dev, osTarget);
                         if (policyRejection != null)
@@ -1644,28 +1935,40 @@ namespace UDA
                 bool needInstall = dev.Bad || string.IsNullOrEmpty(dev.CurrentInf) || string.IsNullOrEmpty(dev.CurrentVersion) ||
                     LanVersion.IsNewer(chosen.Record.DriverVerVersion, dev.CurrentVersion);
                 ClusterNodeStatus downloadNode = _clusterRouter != null ? _clusterRouter.Select(req.MachineName) : null;
-                resp.Candidates.Add(new LanCandidateDto
+                Func<MatchCandidate, LanCandidateDto> describe = match => {
+                var matchEntry = repo.EntryForRelative(match.Record.Path);
+                var matchVerdict = InfApplicability.Evaluate(match.Record, osTarget, devHardware, devCompatible);
+                var rule = releasePolicies.Where(p => devHardware.Concat(devCompatible).Select(HardwareIdNormalizer.Normalize).Contains(p.HardwareId) && p.Architecture == osTarget.Architecture && p.MajorVersion == osTarget.MajorVersion && osTarget.BuildNumber >= p.MinBuild && (p.MaxBuild == 0 || osTarget.BuildNumber <= p.MaxBuild) && (string.IsNullOrEmpty(p.DriverClass) || string.Equals(p.DriverClass, match.Record.Class, StringComparison.OrdinalIgnoreCase))).OrderByDescending(p => HardwareIdNormalizer.Specificity(p.HardwareId)).ThenByDescending(p => p.MinBuild).FirstOrDefault();
+                return new LanCandidateDto
                 {
                     DeviceInstanceId = dev.DeviceInstanceId ?? "",
                     DownloadBaseUrl = downloadNode != null ? downloadNode.Url : "",
                     FriendlyName = friendly,
-                    InfRelativePath = chosen.Record.Path,
-                    PackageInfPath = machinePackage != null ? chosen.Record.Path : entry != null && !string.IsNullOrEmpty(entry.PackageRoot) ? chosen.Record.Path.Substring(entry.PackageRoot.Length + 1) : Path.GetFileName(chosen.Record.Path),
+                    InfRelativePath = match.Record.Path,
+                    PackageInfPath = machinePackage != null ? match.Record.Path : matchEntry != null && !string.IsNullOrEmpty(matchEntry.PackageRoot) ? match.Record.Path.Substring(matchEntry.PackageRoot.Length + 1) : Path.GetFileName(match.Record.Path),
                     PackageId = machineArchive == null ? "" : Path.GetFileNameWithoutExtension(machineArchive),
-                    ContentHash = entry != null ? entry.ContentHash : chosen.Record.ContentHash,
-                    SignatureStatus = entry != null ? entry.SignatureStatus : "",
-                    Provider = chosen.Record.Provider,
-                    Class = chosen.Record.Class,
-                    ClassGuid = chosen.Record.ClassGuid,
-                    DriverVerDate = chosen.Record.DriverVerDate,
-                    DriverVerVersion = chosen.Record.DriverVerVersion,
-                    MatchedId = chosenVerdict.MatchedDeviceId.Length > 0 ? chosenVerdict.MatchedDeviceId : chosen.MatchedId,
-                    MatchedInfId = chosenVerdict.MatchedInfId,
-                    MatchLevel = (int)chosenVerdict.MatchLevel,
-                    NeedInstall = needInstall,
-                    Tier = chosen.Tier,
-                    Decorations = new List<string>(chosen.Record.Decorations ?? new List<string>())
-                });
+                    ContentHash = matchEntry != null ? matchEntry.ContentHash : match.Record.ContentHash,
+                    SignatureStatus = matchEntry != null ? matchEntry.SignatureStatus : "",
+                    Provider = match.Record.Provider,
+                    OemBrand = DriverOemBrands.Resolve(oemBrands, match.Record.ContentHash, match.Record.SourceName, match.Record.Path, match.Record.Manufacturer, match.Record.Provider), MachineBrand = machineBrand,
+                    Class = match.Record.Class,
+                    ClassGuid = match.Record.ClassGuid,
+                    DriverVerDate = match.Record.DriverVerDate,
+                    DriverVerVersion = match.Record.DriverVerVersion,
+                    MatchedId = matchVerdict.MatchedDeviceId.Length > 0 ? matchVerdict.MatchedDeviceId : match.MatchedId,
+                    MatchedInfId = matchVerdict.MatchedInfId,
+                    MatchLevel = (int)matchVerdict.MatchLevel,
+                    NeedInstall = dev.Bad || string.IsNullOrEmpty(dev.CurrentInf) || string.IsNullOrEmpty(dev.CurrentVersion) || LanVersion.IsNewer(match.Record.DriverVerVersion, dev.CurrentVersion),
+                    Tier = match.Tier,
+                    ReleaseChannel = rule == null ? "" : (string.Equals(rule.StableHash, match.Record.ContentHash, StringComparison.OrdinalIgnoreCase) ? "稳定版" : "") + (string.Equals(rule.LatestHash, match.Record.ContentHash, StringComparison.OrdinalIgnoreCase) ? " 最新版" : ""),
+                    Decorations = new List<string>(match.Record.Decorations ?? new List<string>())
+                }; };
+                var recommended = describe(chosen);
+                if (machinePackage == null)
+                    recommended.Versions = DriverReleasePolicies.Order(cands.Where(usable), releasePolicies, osTarget, devHardware.Concat(devCompatible), brandAffinity)
+                        .Where(c => string.Equals(c.Record.Class, chosen.Record.Class, StringComparison.OrdinalIgnoreCase))
+                        .GroupBy(c => c.Record.ContentHash, StringComparer.OrdinalIgnoreCase).Select(g => describe(g.First())).ToList();
+                resp.Candidates.Add(recommended);
             }
             if (!string.IsNullOrEmpty(req.RequestId))
             {
@@ -1712,42 +2015,45 @@ namespace UDA
 
         private void HandleDownload(HttpListenerContext ctx)
         {
-            if (!_packageAccess.TryEnterReadLock(0)) { SafeRespond(ctx, 503, "repository maintenance running; retry download shortly"); return; }
+            bool guarded = !ServerStorage.Config(_config.RepoRoot).DatabaseOnly;
+            if (guarded && !_packageAccess.TryEnterReadLock(0)) { SafeRespond(ctx, 503, "repository maintenance running; retry download shortly"); return; }
             Interlocked.Increment(ref _activeDownloads);
             try
             {
             if (!CheckProtocol(ctx)) { SafeRespond(ctx, 400, "protocol version required"); return; }
             if (!CheckToken(ctx, null)) { SafeRespond(ctx, 401, "token required"); return; }
-            if (ImportRunningNow && !_catalogDeleteRunning) { SafeRespond(ctx, 503, "repository maintenance running; retry download shortly"); return; }
-            string rel = Query(ctx, "path");
-            OfflineRepo repo; lock (_repoLock) repo = _repo;
+            if (guarded && ImportRunningNow && !_catalogDeleteRunning) { SafeRespond(ctx, 503, "repository maintenance running; retry download shortly"); return; }
+            string rel = Query(ctx, "path"), requestedPackage = Query(ctx, "package") ?? "";
+            Publication published; OfflineRepo repo; lock (_repoLock) { repo = _repo; published = _publication; }
             if (repo == null) { SafeRespond(ctx, 503, "repo not loaded"); return; }
-            if (string.IsNullOrWhiteSpace(rel)) { SafeRespond(ctx, 400, "missing path"); return; }
-            string abs = LanSecurity.SafeAbsolute(repo.RepoRoot, rel);
-            if (abs == null) { if (_logger != null) _logger.W("[WARN] 拒绝路径穿越 / Path traversal rejected: " + rel); SafeRespond(ctx, 400, "path traversal rejected"); return; }
-            if (repo.EntryForRelative(rel) == null)
-            {
-                rel = OfflineRepoGenerator.ResolvePathAlias(repo.RepoRoot, rel);
-                abs = LanSecurity.SafeAbsolute(repo.RepoRoot, rel);
-            }
-            if (abs == null) { SafeRespond(ctx, 404, "file not found"); return; }
-            // Serve the package directory (the directory containing the INF, with its companion files) as a ZIP.
+            if (string.IsNullOrWhiteSpace(rel) || LanSecurity.SafeAbsolute(repo.RepoRoot, rel) == null) { SafeRespond(ctx, 400, "path traversal rejected"); return; }
+            if (requestedPackage.Length > 0 && !System.Text.RegularExpressions.Regex.IsMatch(requestedPackage, "^model-[a-f0-9]{64}$")) { SafeRespond(ctx, 400, "invalid model package"); return; }
             var entry = repo.EntryForRelative(rel);
-            if (entry == null) { SafeRespond(ctx, 404, "driver is not published in repository"); return; }
-            string archivePath = TestDownloadOverride == null ? OfflineRepoGenerator.DownloadArchivePath(repo.RepoRoot, entry) : null;
-            if (TestDownloadOverride == null)
+            string archivePath = null, downloadHash = entry == null ? "" : entry.ContentHash;
+            bool currentPackage = entry != null && (requestedPackage.Length == 0 || published.Models.Any(m => MachineDriverPackages.Contains(entry, m) && Path.GetFileNameWithoutExtension(published.ModelFiles[m.SourceName + "|" + m.PackagePrefix]) == requestedPackage));
+            RetiredDriverDownload retired;
+            if (!currentPackage && _retiredDownloads.TryGetValue(DownloadKey(rel, requestedPackage), out retired) && string.CompareOrdinal(retired.ExpiresUtc, DateTime.UtcNow.ToString("o")) > 0)
             {
-                string requestedPackage = Query(ctx, "package");
-                var policies = MachineDriverPackages.Load(repo.RepoRoot).Where(p => MachineDriverPackages.Contains(entry, p)).ToList();
-                var selected = string.IsNullOrEmpty(requestedPackage) ? policies.FirstOrDefault() : policies.FirstOrDefault(p => Path.GetFileNameWithoutExtension(MachineDriverPackages.Archive(repo.RepoRoot, p.SourceName, p.PackagePrefix, false)) == requestedPackage);
-                if (!string.IsNullOrEmpty(requestedPackage) && selected == null) { SafeRespond(ctx, 404, "model package does not contain this driver"); return; }
-                if (selected != null) archivePath = MachineDriverPackages.Archive(repo.RepoRoot, selected.SourceName, selected.PackagePrefix);
+                string revoked = ServerStorage.Read(repo.RepoRoot, "repo.revoked-download-paths.json");
+                var revokedPaths = new HashSet<string>(revoked == null ? new List<string>() : new JavaScriptSerializer { MaxJsonLength = int.MaxValue }.Deserialize<List<string>>(revoked), StringComparer.OrdinalIgnoreCase);
+                if (!revokedPaths.Contains(rel) && !revokedPaths.Contains(OfflineRepoGenerator.ResolvePathAlias(repo.RepoRoot, rel)))
+                { archivePath = LanSecurity.SafeAbsolute(repo.RepoRoot, ".uda-downloads/" + retired.Archive); downloadHash = retired.Hash; }
             }
-            if (TestDownloadOverride == null && (string.IsNullOrEmpty(archivePath) || !File.Exists(archivePath))) { SafeRespond(ctx, 503, "driver archive is being prepared; retry shortly"); return; }
-            string downloadDir = entry.PackageRoot ?? Path.GetDirectoryName(rel);
+            if (archivePath == null)
+            {
+                if (entry == null) { rel = OfflineRepoGenerator.ResolvePathAlias(repo.RepoRoot, rel); entry = repo.EntryForRelative(rel); }
+                if (entry == null) { SafeRespond(ctx, 404, "driver is not published in repository"); return; }
+                downloadHash = entry.ContentHash;
+                archivePath = OfflineRepoGenerator.DownloadArchivePath(repo.RepoRoot, entry);
+                var selected = published.Models.FirstOrDefault(m => MachineDriverPackages.Contains(entry, m) && (requestedPackage.Length == 0 || Path.GetFileNameWithoutExtension(published.ModelFiles[m.SourceName + "|" + m.PackagePrefix]) == requestedPackage));
+                if (requestedPackage.Length > 0 && selected == null) { SafeRespond(ctx, 404, "model package does not contain this driver"); return; }
+                if (selected != null) archivePath = Path.Combine(repo.RepoRoot, ".uda-downloads", published.ModelFiles[selected.SourceName + "|" + selected.PackagePrefix]);
+            }
+            if (TestDownloadOverride == null && !File.Exists(archivePath)) { SafeRespond(ctx, 503, "driver archive is being prepared; retry shortly"); return; }
+            string downloadDir = entry == null ? Path.GetDirectoryName(rel) : entry.PackageRoot ?? Path.GetDirectoryName(rel);
             ctx.Response.StatusCode = 200;
             ctx.Response.ContentType = "application/zip";
-            ctx.Response.Headers[LanProtocol.HeaderInfHash] = entry != null ? entry.ContentHash : "";
+            ctx.Response.Headers[LanProtocol.HeaderInfHash] = downloadHash;
             try
             {
                 if (_logger != null) _logger.W("[INFO] 开始流式下载 / Download starting: " + rel + "; active=" + Volatile.Read(ref _activeDownloads));
@@ -1774,7 +2080,7 @@ namespace UDA
                 try { ctx.Response.Abort(); } catch { }
             }
             }
-            finally { Interlocked.Decrement(ref _activeDownloads); _packageAccess.ExitReadLock(); }
+            finally { Interlocked.Decrement(ref _activeDownloads); if (guarded) _packageAccess.ExitReadLock(); }
         }
 
         private void HandleImport(HttpListenerContext ctx)
@@ -1854,7 +2160,7 @@ namespace UDA
                 var gen = new OfflineRepoGenerator(ImportSignatureVerifier ?? new WinTrustSignatureVerifier(), _logger);
                 var osTarget = new OsTarget { Architecture = _config.OsArchitecture, MajorVersion = _config.OsMajorVersion };
                 var sources = BuildSources(src);
-                MutateRepository(() => gen.AppendOrganizedSource(_config.RepoRoot, src, _cts.Token, null), null, null, false);
+                MutateRepository(workRoot => gen.AppendOrganizedSource(workRoot, src, _cts.Token, null), null, null, false);
                 FinalizeUploadedSource(src);
                 if (_logger != null) _logger.W("[INFO] 仓库导入/重建完成 / Repo import/rebuild done: " + src);
                 RespondJson(ctx, 200, new { ok = true, infCount = RepoCount() });
@@ -1895,7 +2201,7 @@ namespace UDA
                 bool repositoryExists = OfflineRepoGenerator.TryLoadManifest(_config.RepoRoot) != null;
                 if (repositoryExists && string.IsNullOrWhiteSpace(src))
                     throw new InvalidOperationException("已有仓库的追加任务必须指定新增驱动目录；已拒绝整库重建");
-                report = MutateRepository(() => gen.AppendOrganizedSource(_config.RepoRoot, src, _cts.Token, progress), progress, null, false);
+                report = MutateRepository(workRoot => gen.AppendOrganizedSource(workRoot, src, _cts.Token, progress), progress, null, false);
                 FinalizeUploadedSource(src);
                 lock (_importLock) { _importStage = "loading"; _importMessage = "增量索引已发布并热加载"; }
                 lock (_importLock)
@@ -1997,27 +2303,23 @@ namespace UDA
         {
             if (!IsRepoMutatorAuthorized(ctx)) return;
             string body = ReadBody(ctx); if (body == null) return;
-            Dictionary<string, object> arguments;
-            try { arguments = new JavaScriptSerializer().Deserialize<Dictionary<string, object>>(body); }
-            catch { SafeRespond(ctx, 400, "invalid AI task"); return; }
-            string action = arguments != null && arguments.ContainsKey("action") ? Convert.ToString(arguments["action"]) : "";
-            if (action != "classify" && action != "releases" && action != "discover" && action != "update") { SafeRespond(ctx, 400, "unknown AI task"); return; }
-            lock (_importLock)
+            try
             {
-                if (_importRunning) { SafeRespond(ctx, 409, "repo mutation job already running"); return; }
-                _importRunning = true; _importStage = "ai-" + action; _importMessage = "正在运行 AI 后台任务"; _importError = ""; _importStartedUtc = DateTime.UtcNow; _importFinishedUtc = DateTime.MinValue;
-            }
-            ThreadPool.QueueUserWorkItem(delegate {
-                try
+                var args = new JavaScriptSerializer().Deserialize<Dictionary<string, object>>(body);
+                string action = args != null && args.ContainsKey("action") ? Convert.ToString(args["action"]) : "";
+                if (action == "pause" || action == "resume" || action == "cancel")
                 {
-                    string summary = MutateRepository(() => _webAdmin.RunAiTask(action, arguments, _cts.Token, message => { lock (_importLock) _importMessage = message; }));
-                    LoadRepo(); lock (_cacheLock) _cache.Clear();
-                    lock (_importLock) { _importStage = "completed"; _importMessage = summary; }
+                    string taskId = args.ContainsKey("id") ? Convert.ToString(args["id"]) : "";
+                    if (!_aiTasks.Control(taskId, action)) { SafeRespond(ctx, 409, "任务已结束或当前状态不支持此操作，请刷新任务列表"); return; }
+                    RespondJson(ctx, 202, new { ok = true, id = taskId, statusUrl = "/api/admin/ai/status" }); return;
                 }
-                catch (Exception ex) { lock (_importLock) { _importStage = "failed"; _importError = ex.Message; _importMessage = "AI 任务失败，未执行模型生成的命令"; } RecordError("AI task failed: " + ex.GetType().Name); }
-                finally { lock (_importLock) { _importRunning = false; _importFinishedUtc = DateTime.UtcNow; } ReschedulePendingWatchUpdate(); }
-            });
-            RespondJson(ctx, 202, new { ok = true, statusUrl = "/api/admin/import-status" });
+                if (action != "releases" && action != "news") { SafeRespond(ctx, 400, "仅支持版本整理、驱动资讯和任务控制操作"); return; }
+                string id;
+                if (!_aiTasks.Begin(action, false, out id)) { RespondJson(ctx, 409, new { ok = false, id, error = "同类型任务正在运行，请在任务列表中查看、暂停或中断；不同类型任务可并行" }); return; }
+                RespondJson(ctx, 202, new { ok = true, id, statusUrl = "/api/admin/ai/status" });
+            }
+            catch (InvalidOperationException ex) { SafeRespond(ctx, 409, ex.Message); }
+            catch (Exception) { SafeRespond(ctx, 400, "invalid AI task"); }
         }
 
         private void HandleOrganize(HttpListenerContext ctx)
@@ -2032,8 +2334,8 @@ namespace UDA
                 try
                 {
                     var generator = new OfflineRepoGenerator(ImportSignatureVerifier ?? new WinTrustSignatureVerifier(), _logger);
-                    int moved = MutateRepository(() => generator.Organize(_config.RepoRoot, _cts.Token, new InlineProgress(message => { lock (_importLock) _importMessage = message; })));
-                    LoadRepo();
+                    int moved = MutateRepository(workRoot => generator.Organize(workRoot, _cts.Token, new InlineProgress(message => { lock (_importLock) _importMessage = message; })));
+                    if (!ServerStorage.Config(_config.RepoRoot).DatabaseOnly) LoadRepo();
                     lock (_importLock) { _importStage = "completed"; _importMessage = "整理完成：移动 " + moved + " 个完整驱动包，未复制仓库"; }
                 }
                 catch (Exception ex) { lock (_importLock) { _importStage = "failed"; _importError = ex.Message; _importMessage = "整理失败，已尝试回滚"; } RecordError("organization failed: " + ex); }
@@ -2054,8 +2356,8 @@ namespace UDA
                 try
                 {
                     var gen = new OfflineRepoGenerator(ImportSignatureVerifier ?? new WinTrustSignatureVerifier(), _logger);
-                    OfflineRepoDuplicateReport report = MutateRepository(() => gen.Clean(repoRoot, _cts.Token, null));
-                    LoadRepo();
+                    OfflineRepoDuplicateReport report = MutateRepository(workRoot => gen.Clean(workRoot, _cts.Token, null));
+                    if (!ServerStorage.Config(_config.RepoRoot).DatabaseOnly) LoadRepo();
                     RespondJson(ctx, 200, new { ok = true, removed = report.DuplicateCount, kept = report.KeptCount, cleaned = report.Cleaned });
                 }
                 catch (Exception ex) { RecordError("repo dedupe failed (previous repo kept / 仓库清理失败，保留上一份可用仓库): " + ex.Message); SafeRespond(ctx, 500, "dedupe failed: " + ex.Message); }
@@ -2111,14 +2413,15 @@ namespace UDA
                     // Serialize with archive writers while allowing concurrent download readers.
                     _packageAccess.EnterUpgradeableReadLock();
                     try {
-                        removed = ServerStorage.DeleteCatalogEntries(_config.RepoRoot, ids, snapshot => {
-                            lock (_repoLock) { _repo = snapshot; _archiveSetReady = true; }
+                        lock (_maintenanceGate) removed = ServerStorage.DeleteCatalogEntries(_config.RepoRoot, ids, snapshot => {
+                            var prepared = PreparePublication(snapshot, _config.RepoRoot);
+                            lock (_repoLock) { _repo = snapshot; _publication = prepared; _archiveSetReady = true; }
                             lock (_cacheLock) _cache.Clear();
                         });
                     }
                     finally { _packageAccess.ExitUpgradeableReadLock(); }
                 }
-                else removed = MutateRepository(() => gen.DeleteEntries(_config.RepoRoot, ids, _cts.Token, null));
+                else removed = MutateRepository(workRoot => gen.DeleteEntries(workRoot, ids, _cts.Token, null));
                 lock (_importLock) { _importRunning = false; _importStage = "completed"; _importMessage = "已删除 " + removed + " 个驱动"; _importFinishedUtc = DateTime.UtcNow; }
                 RespondJson(ctx, 200, new { ok = true, removed = removed, kept = RepoCount() });
             }
@@ -2139,9 +2442,9 @@ namespace UDA
                 {
                     lock (_importLock) { _importStage = "dedupe-running"; _importMessage = message ?? ""; }
                 });
-                OfflineRepoDuplicateReport report = MutateRepository(() => gen.Clean(_config.RepoRoot, _cts.Token, progress));
+                OfflineRepoDuplicateReport report = MutateRepository(workRoot => gen.Clean(workRoot, _cts.Token, progress));
                 lock (_importLock) { _importStage = "loading"; _importMessage = "清理完成，正在热加载仓库"; }
-                LoadRepo();
+                if (!ServerStorage.Config(_config.RepoRoot).DatabaseOnly) LoadRepo();
                 lock (_importLock)
                 {
                     _importInfCount = RepoCount();
@@ -2356,6 +2659,8 @@ namespace UDA
     public static class ClientTelemetryQueue
     {
         private static readonly object Gate = new object();
+        internal static string TestDirectory;
+        internal static void UseTestDirectory(string root) { TestDirectory = Path.GetFullPath(root); }
         public static void Enqueue(string directory, DriverInstallEvent entry)
         {
             lock (Gate)
@@ -2371,17 +2676,24 @@ namespace UDA
                 File.Move(temporary, path);
             }
         }
+        private static readonly ConcurrentDictionary<string, object> SendLocks = new ConcurrentDictionary<string, object>(StringComparer.OrdinalIgnoreCase);
         public static int Flush(string directory, Func<DriverInstallEvent, bool> send, int maximum)
         {
-            lock (Gate)
+            lock (SendLocks.GetOrAdd(directory, key => new object()))
             {
-                if (!Directory.Exists(directory)) return 0;
+                string[] files;
+                lock (Gate) {
+                    if (!Directory.Exists(directory)) return 0;
+                    files = Directory.EnumerateFiles(directory, "*.json").OrderBy(f => File.GetLastWriteTimeUtc(f)).Take(maximum).ToArray();
+                }
                 int sent = 0;
-                foreach (string file in Directory.EnumerateFiles(directory, "*.json").OrderBy(f => File.GetLastWriteTimeUtc(f)).Take(maximum))
+                foreach (string file in files)
                 {
-                    DriverInstallEvent entry = new JavaScriptSerializer().Deserialize<DriverInstallEvent>(File.ReadAllText(file));
+                    DriverInstallEvent entry;
+                    lock (Gate) { if (!File.Exists(file)) continue; entry = new JavaScriptSerializer().Deserialize<DriverInstallEvent>(File.ReadAllText(file)); }
+                    // Never hold the local persistence lock during a potentially slow network call.
                     if (!send(entry)) break;
-                    File.Delete(file); sent++;
+                    lock (Gate) { if (File.Exists(file)) File.Delete(file); } sent++;
                 }
                 return sent;
             }
@@ -2390,7 +2702,88 @@ namespace UDA
 
     public sealed class LanDriverClient
     {
-        private readonly string _telemetryRun = Guid.NewGuid().ToString("N");
+        private string _telemetryRun = Guid.NewGuid().ToString("N");
+        private readonly string _telemetryMachineId = TelemetryMachineId();
+        private string _telemetryMac;
+        private int _telemetryChunk, _telemetryLoopDepth;
+        private static string TelemetryMachineId()
+        {
+            string seed = Environment.MachineName;
+            try { using (var key = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(@"SOFTWARE\Microsoft\Cryptography")) if (key != null) seed += "|" + Convert.ToString(key.GetValue("MachineGuid")); } catch { }
+            using (var sha = SHA256.Create()) return BitConverter.ToString(sha.ComputeHash(Encoding.UTF8.GetBytes(seed))).Replace("-", "").ToLowerInvariant();
+        }
+        private LiveClientDiagnostics _liveDiagnostics;
+        public string DiagnosticRunId { get { return _telemetryRun; } }
+        public void PublishDiagnosticState(string status, string detail)
+        {
+            if (_liveDiagnostics == null) return;
+            try { var entry = NewTelemetryEvent(status, RedactDiagnosticText(detail)); entry.Device = "__UDA_SESSION__"; entry.Name = "部署状态"; entry.CountInUsage = false;
+                ClientTelemetryQueue.Enqueue(TelemetryDirectory, entry); _liveDiagnostics.LastState = status; FlushTelemetry();
+            } catch (Exception ex) { ServiceEventLog.Write("warning", "Client session state retained locally: " + ex.Message); }
+        }
+
+        private void BeginTelemetryRun() {
+            if (_liveDiagnostics != null && _liveDiagnostics.PreserveRun) return;
+            if (_liveDiagnostics != null) { _liveDiagnostics.Persist(); if (_liveDiagnostics.LastState == "running") PublishDiagnosticState("log", "扫描阶段结束，开始安装任务"); }
+            _telemetryRun = Guid.NewGuid().ToString("N"); _telemetryChunk = 0; _telemetryMac = null;
+            if (_liveDiagnostics != null) PublishDiagnosticState("running", "安装任务开始");
+        }
+        public IDisposable StartLiveDiagnostics(string mode, bool preserveRun, string runId = null)
+        {
+            if (_liveDiagnostics != null) throw new InvalidOperationException("Client diagnostics already started");
+            Guid id; if (!string.IsNullOrEmpty(runId)) { if (!Guid.TryParseExact(runId, "N", out id)) throw new ArgumentException("Invalid session ID"); _telemetryRun = id.ToString("N"); }
+            var session = new LiveClientDiagnostics(this, preserveRun); _liveDiagnostics = session;
+            session.Start(mode); PublishDiagnosticState("running", "客户端已启动：" + mode); return session;
+        }
+        internal static string RedactDiagnosticText(string text)
+        {
+            text = System.Text.RegularExpressions.Regex.Replace(text ?? "", @"(?i)(--(?:token|api-key|password)\s+)(?:""[^""]*""|\S+)", "$1***");
+            return System.Text.RegularExpressions.Regex.Replace(text, @"(?i)((?:authorization|api[_-]?key|password|pwd|token)\s*[:=]\s*(?:Bearer\s+)?)[^\s;&]+", "$1***");
+        }
+        private sealed class LiveClientDiagnostics : IDisposable
+        {
+            readonly LanDriverClient owner; readonly object gate = new object(); readonly StringBuilder buffer = new StringBuilder();
+            readonly ManualResetEvent idle = new ManualResetEvent(true); System.Threading.Timer timer; int working, stopped;
+            public readonly bool PreserveRun; public string LastState = "running";
+            public LiveClientDiagnostics(LanDriverClient client, bool preserve) { owner = client; PreserveRun = preserve; }
+            public void Start(string mode) {
+                owner._logger.E += Capture;
+                try { string path = owner._logger.Path; using (var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite)) {
+                    long skip = Math.Max(0, stream.Length - 65536); stream.Position = skip;
+                    using (var reader = new StreamReader(stream, Encoding.UTF8)) { if (skip > 0) reader.ReadLine(); Capture(reader.ReadToEnd()); }
+                } } catch { }
+                owner._logger.W("[INFO] Client diagnostics started: mode=" + mode + "; client=" + LanProtocol.ServerVersion + "; identity=" + System.Security.Principal.WindowsIdentity.GetCurrent().Name +
+                    "; os=" + Environment.OSVersion.Version + "; process64=" + Environment.Is64BitProcess + "; run=" + owner._telemetryRun);
+                Persist(); timer = new System.Threading.Timer(state => { Persist(); Kick(); }, null, 0, 2000);
+            }
+            void Capture(string line) {
+                lock (gate) buffer.AppendLine(RedactDiagnosticText(line));
+                if (buffer.Length >= 8192) Persist();
+            }
+            public void Persist() {
+                try { lock (gate) { while (buffer.Length > 0) {
+                    int length = Math.Min(8192, buffer.Length); var entry = owner.NewTelemetryEvent("log", buffer.ToString(0, length)); entry.CountInUsage = false;
+                    ClientTelemetryQueue.Enqueue(owner.TelemetryDirectory, entry); buffer.Remove(0, length);
+                } } } catch (Exception ex) { ServiceEventLog.Write("warning", "Client diagnostic queue: " + ex.Message); }
+            }
+            public void Kick() {
+                if (Interlocked.CompareExchange(ref working, 1, 0) != 0) return;
+                idle.Reset();
+                ThreadPool.QueueUserWorkItem(state => {
+                    try { var clock = System.Diagnostics.Stopwatch.StartNew(); ClientTelemetryQueue.Flush(owner.TelemetryDirectory, entry => clock.ElapsedMilliseconds < 2500 && owner.TransmitTelemetry(entry), 16); }
+                    catch (Exception ex) { ServiceEventLog.Write("warning", "Client diagnostics retained: " + ex.Message); }
+                    finally { Interlocked.Exchange(ref working, 0); idle.Set(); }
+                });
+            }
+            public void Dispose() {
+                if (Interlocked.Exchange(ref stopped, 1) != 0) return;
+                if (timer != null) timer.Dispose();
+                if (LastState == "running") owner.PublishDiagnosticState("log", "客户端已退出；未收到最终安装核验结果");
+                owner._logger.E -= Capture;
+                Persist(); Kick(); idle.WaitOne(3000); owner._liveDiagnostics = null;
+            }
+        }
+
         private string TelemetryDirectory
         {
             get
@@ -2399,17 +2792,20 @@ namespace UDA
                 {
                     string endpoint = (_config.ServerUrl ?? "").TrimEnd('/').ToLowerInvariant() + "|" + (_config.Token ?? "");
                     string scope = BitConverter.ToString(sha.ComputeHash(Encoding.UTF8.GetBytes(endpoint))).Replace("-", "");
-                    return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "UniversalDriverAssistant", "TelemetryQueue", scope);
+                    return string.IsNullOrEmpty(ClientTelemetryQueue.TestDirectory) ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "UniversalDriverAssistant", "TelemetryQueue", scope) : Path.Combine(ClientTelemetryQueue.TestDirectory, scope);
                 }
             }
         }
         private DriverInstallEvent NewTelemetryEvent(string status, string detail)
         {
             var macs = System.Net.NetworkInformation.NetworkInterface.GetAllNetworkInterfaces().Where(n => n.NetworkInterfaceType != System.Net.NetworkInformation.NetworkInterfaceType.Loopback).Select(n => n.GetPhysicalAddress().ToString()).Where(m => m.Length > 0).OrderBy(m => m);
-            return new DriverInstallEvent { EventId = Guid.NewGuid().ToString("N"), RunId = _telemetryRun, Machine = Environment.MachineName, Mac = string.Join(",", macs), Status = status, Detail = detail, Utc = DateTime.UtcNow.ToString("o") };
+            if (_telemetryMac == null) _telemetryMac = string.Join(",", macs);
+            return new DriverInstallEvent { EventId = Guid.NewGuid().ToString("N"), RunId = _telemetryRun, MachineId = _telemetryMachineId, Machine = Environment.MachineName, Mac = _telemetryMac, ChunkIndex = Interlocked.Increment(ref _telemetryChunk), Status = status, Detail = detail, Utc = DateTime.UtcNow.ToString("o") };
         }
+        internal Func<DriverInstallEvent, bool> TestTelemetryTransport;
         private bool TransmitTelemetry(DriverInstallEvent entry)
         {
+            if (TestTelemetryTransport != null) return TestTelemetryTransport(entry);
             try
             {
                 byte[] bytes = Encoding.UTF8.GetBytes(new JavaScriptSerializer().Serialize(entry));
@@ -2423,6 +2819,7 @@ namespace UDA
         }
         private void FlushTelemetry()
         {
+            if (_liveDiagnostics != null) { _liveDiagnostics.Persist(); _liveDiagnostics.Kick(); return; }
             try { ClientTelemetryQueue.Flush(TelemetryDirectory, TransmitTelemetry, 100); }
             catch (Exception ex) { if (_logger != null) _logger.W("[WARN] 日志队列保留待重传 / telemetry queue retained: " + ex.Message); }
         }
@@ -2440,7 +2837,7 @@ namespace UDA
         }
         private readonly LanClientConfig _config;
         private readonly L _logger;
-        private readonly Machine _machine;
+        private Machine _machine;
         private readonly IHardwareCollector _hc;
         private readonly OsTarget _osTarget;
         private readonly ISignatureVerifier _sig;
@@ -2463,6 +2860,7 @@ namespace UDA
 
         public LanClientResult Run(CancellationToken ct)
         {
+            BeginTelemetryRun();
             var result = new LanClientResult();
             Action<string> log = m => { result.Log.Add(m); if (_logger != null) _logger.W("[INFO] " + m); };
             string cacheRoot = null, staging = null;
@@ -2501,6 +2899,7 @@ namespace UDA
 
                 if (ct.IsCancellationRequested) { result.Cancelled = true; result.Error = "cancelled"; return result; }
 
+                _lastReportedDevices = devices;
                 // (2) Probe server with retry/backoff.
                 if (!WaitForServer(ct, log))
                 {
@@ -2512,7 +2911,7 @@ namespace UDA
                 // (3) Report hardware inventory.
                 var req = new LanReportRequest
                 {
-                    Protocol = LanProtocol.Version,
+                    Protocol = LanProtocol.Version, SupportsExtensionPackages = true,
                     RequestId = Guid.NewGuid().ToString("N", CultureInfo.InvariantCulture),
                     MachineManufacturer = _machine != null ? _machine.Maker : "",
                     MachineModel = _machine != null ? _machine.Model : "",
@@ -2558,7 +2957,7 @@ namespace UDA
                 var installedHashes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                 var deviceById = devices.Where(d => !string.IsNullOrEmpty(d.Id)).ToDictionary(d => d.Id, StringComparer.OrdinalIgnoreCase);
                 InstallModelPackages(resp.Candidates, devices, staging, result, ct, null, log);
-                foreach (var cand in resp.Candidates.Where(c => string.IsNullOrEmpty(c.PackageId)))
+                foreach (var cand in resp.Candidates.Where(c => string.IsNullOrEmpty(c.PackageId)).OrderBy(c => c.IsExtension))
                 {
                     if (ct.IsCancellationRequested) { result.Cancelled = true; result.Error = "cancelled"; break; }
                     if (string.IsNullOrEmpty(cand.ContentHash)) { log("跳过无哈希候选 / Skip candidate without hash: " + cand.InfRelativePath); continue; }
@@ -2566,7 +2965,7 @@ namespace UDA
                     string skipWhy;
                     if (!ShouldInstall(cand, deviceById, out skipWhy)) { result.InstalledSkip++; log("跳过 / Skip " + Path.GetFileName(cand.InfRelativePath ?? "") + ": " + skipWhy); continue; }
                     // Idempotency: deduplicate only after confirming this device needs the package.
-                    if (!installedHashes.Add(cand.ContentHash)) { log("跳过重复内容 / Skip duplicate content: " + cand.InfRelativePath); continue; }
+                    if (!installedHashes.Add(cand.UserSelectedVersion || cand.IsExtension ? cand.DeviceInstanceId + "|" + cand.ContentHash : cand.ContentHash)) { log("跳过重复内容 / Skip duplicate content: " + cand.InfRelativePath); continue; }
 
                     if (!string.IsNullOrEmpty(cand.PackageId) && !System.Text.RegularExpressions.Regex.IsMatch(cand.PackageId, "^model-[a-f0-9]{64}$")) throw new InvalidDataException("Invalid model package identity");
                     string extractDir = Path.Combine(staging, string.IsNullOrEmpty(cand.PackageId) ? cand.ContentHash.Substring(0, Math.Min(8, cand.ContentHash.Length)) : cand.PackageId.Substring(0, 22));
@@ -2589,7 +2988,7 @@ namespace UDA
                     // and current OS; a rejection is logged with its precise reason, never a bare skip.
                     D revalDev; deviceById.TryGetValue(cand.DeviceInstanceId, out revalDev);
                     string revalCode;
-                    string revalWhy = RevalidateExtractedInf(infAbs, revalDev, _osTarget, out revalCode);
+                    string revalWhy = RevalidateCandidateInf(cand, infAbs, revalDev, out revalCode);
                     if (revalWhy != null)
                     {
                         if (string.Equals(revalCode, "CurrentDriverPreferred", StringComparison.OrdinalIgnoreCase))
@@ -2597,12 +2996,13 @@ namespace UDA
                         result.InstalledSkip++; log(revalWhy + " — " + Path.GetFileName(infAbs)); continue;
                     }
 
+                    if (!ExtensionParentReady(cand, deviceById, log)) { result.InstalledSkip++; continue; }
                     var rec = new InfRecord { Path = infAbs, ContentHash = cand.ContentHash, Class = cand.Class, ClassGuid = cand.ClassGuid,
                         DriverVerDate = cand.DriverVerDate, DriverVerVersion = cand.DriverVerVersion, Provider = cand.Provider,
                         HardwareIds = new List<string>(), CompatibleIds = new List<string>() };
                     var sum = DriverInstallExecutor.Execute(new List<InfRecord> { rec }, new List<string> { extractDir }, _config.DedupeByContent,
                         _config.WhatIf, _config.Deploy, _config.InstallTimeoutSeconds, _config.VerifySignature,
-                        _logger, _admin, _sig, _runner, _sys, abs => string.Equals(Sha256File(abs), cand.ContentHash, StringComparison.OrdinalIgnoreCase), null);
+                        _logger, _admin, _sig, InstallationRunner(cand), _sys, abs => string.Equals(Sha256File(abs), cand.ContentHash, StringComparison.OrdinalIgnoreCase), null);
                     ConfirmInstalledBinding(cand, sum, result, ct, log);
                     result.InstalledOk += sum.Ok; result.InstalledSkip += sum.Skip; result.InstalledFail += sum.Fail;
                     SendInstallEvent(cand, sum, revalDev, !_config.WhatIf && (_runner == null || _runner is PnpInstallRunner));
@@ -2664,6 +3064,7 @@ namespace UDA
         public LanReportResponse Report(IEnumerable<D> devices, Machine machine, CancellationToken ct, IProgress<string> progress)
         {
             FlushTelemetry();
+            if (machine != null) _machine = machine; else machine = _machine;
             var reportClock = System.Diagnostics.Stopwatch.StartNew();
             _lastReportedDevices = (devices ?? Enumerable.Empty<D>()).ToList();
             devices = _lastReportedDevices;
@@ -2671,7 +3072,7 @@ namespace UDA
             if (progress != null) progress.Report("正在上报硬件清单到服务器…");
             var req = new LanReportRequest
             {
-                Protocol = LanProtocol.Version,
+                Protocol = LanProtocol.Version, SupportsExtensionPackages = true,
                 RequestId = Guid.NewGuid().ToString("N", CultureInfo.InvariantCulture),
                 MachineManufacturer = machine != null ? machine.Maker : "",
                 MachineModel = machine != null ? machine.Model : "",
@@ -2699,6 +3100,19 @@ namespace UDA
             LanReportResponse resp;
             if (!PostJson(_config.ServerUrl + "/api/report", req, ct, out resp))
                 throw new InvalidOperationException("上报失败 / report failed: " + (resp != null ? resp.Error : "无法连接服务器"));
+            // Keep missing-device evidence in the diagnostic log, not only in the UI.
+            if (_logger != null)
+                foreach (var missing in resp.UnmatchedDevices ?? new List<LanUnmatchedDeviceDto>())
+                {
+                    D device = _lastReportedDevices.FirstOrDefault(d => string.Equals(d.Id, missing.DeviceInstanceId, StringComparison.OrdinalIgnoreCase));
+                    if (device != null && device.Bad)
+                        _logger.W("[WARN] 未匹配异常设备 / Unmatched device: " + device.Id + "; code=" + device.Error + "; hardware=[" + string.Join(",", device.H.ToArray()) + "]; reason=" + missing.ReasonCode + " " + missing.Reason);
+                }
+            if (_liveDiagnostics != null && _logger != null) {
+                _logger.W("[INFO] Scan diagnostic: devices=" + _lastReportedDevices.Count + "; candidates=" + resp.Candidates.Count + "; unmatched=" + (resp.UnmatchedDevices == null ? 0 : resp.UnmatchedDevices.Count));
+                foreach (var device in _lastReportedDevices.Where(d => d.NeedsAttention)) _logger.W("[INFO] Problem device: " + device.Id + "; code=" + device.Error + "; INF=" + device.Inf + "; H=[" + string.Join(",", device.H) + "]; K=[" + string.Join(",", device.K) + "]");
+                foreach (var candidate in resp.Candidates) _logger.W("[INFO] Candidate decision: " + candidate.DeviceInstanceId + "; INF=" + candidate.InfRelativePath + "; version=" + candidate.DriverVerVersion + "; need=" + candidate.NeedInstall + "; extension=" + candidate.IsExtension);
+            }
             long matchMs = reportClock.ElapsedMilliseconds;
             ValidateScanCandidates(resp.Candidates.Where(c => c.NeedInstall).ToList(), ct, progress);
             if (_logger != null) _logger.W("[INFO] Scan report timing: bindingAndServerMs=" + matchMs + "; validationMs=" + (reportClock.ElapsedMilliseconds - matchMs) + "; totalMs=" + reportClock.ElapsedMilliseconds + "; devices=" + _lastReportedDevices.Count);
@@ -2718,6 +3132,11 @@ namespace UDA
             {
                 ct.ThrowIfCancellationRequested();
                 D device; devices.TryGetValue(candidate.DeviceInstanceId ?? "", out device);
+                if (candidate.IsExtension)
+                {
+                    if (LanExtensionPackages.Satisfied(candidate, device, _osTarget, scanFiles)) RejectScanCandidate(candidate, "配套扩展已应用于设备");
+                    continue;
+                }
                 bool windowsRejected = LanPnpRejectionStore.Contains(candidate, device, _osTarget);
                 if (windowsRejected || IsReceiptSuppressed(candidate, device))
                 {
@@ -2729,7 +3148,7 @@ namespace UDA
             var updates = candidates.Where(candidate =>
             {
                 D device; devices.TryGetValue(candidate.DeviceInstanceId ?? "", out device);
-                return candidate.NeedInstall && device != null && !device.Bad && !string.IsNullOrEmpty(device.Inf) && !string.IsNullOrEmpty(device.Version);
+                return !candidate.IsExtension && candidate.NeedInstall && device != null && !device.Bad && !string.IsNullOrEmpty(device.Inf) && !string.IsNullOrEmpty(device.Version);
             }).ToList();
             if (updates.Count == 0) return;
             var imported = LanInstalledPackage.FindImportedInfs(updates.Select(c => c.ContentHash), processors, ct, scanFiles);
@@ -2921,6 +3340,8 @@ namespace UDA
 
         public LanClientResult InstallCandidates(IList<LanCandidateDto> candidates, IList<D> devices, CancellationToken ct, IProgress<LanInstallProgress> progress)
         {
+            if (Volatile.Read(ref _telemetryLoopDepth) == 0) BeginTelemetryRun();
+            bool captureInstallOnly = _liveDiagnostics == null;
             var logBuffer = new StringBuilder(); var logGate = new object();
             Action<string> capture = line => {
                 lock (logGate)
@@ -2929,7 +3350,7 @@ namespace UDA
                     while (logBuffer.Length >= 8192) { ClientTelemetryQueue.Enqueue(TelemetryDirectory, NewTelemetryEvent("log", logBuffer.ToString(0, 8192))); logBuffer.Remove(0, 8192); }
                 }
             };
-            if (_logger != null) _logger.E += capture;
+            if (captureInstallOnly && _logger != null) _logger.E += capture;
             var result = new LanClientResult();
             Action<string> log = m => { result.Log.Add(m); if (_logger != null) _logger.W("[INFO] " + m); };
             string cacheRoot = null, runDir = null;
@@ -2958,7 +3379,7 @@ namespace UDA
                     if (string.IsNullOrEmpty(cand.ContentHash)) { log("跳过无哈希候选 / Skip candidate without hash: " + cand.InfRelativePath); result.InstalledSkip++; continue; }
                     string skipWhy;
                     if (!ShouldInstall(cand, deviceById, out skipWhy)) { result.InstalledSkip++; log("跳过已是最新 / Skip up-to-date: " + infName + ": " + skipWhy); continue; }
-                    if (!installedHashes.Add(cand.ContentHash)) { log("合并同包设备，安装后逐设备核验 / Shared package, verify each target after installation: " + cand.DeviceInstanceId); continue; }
+                    if (!installedHashes.Add(cand.UserSelectedVersion || cand.IsExtension ? cand.DeviceInstanceId + "|" + cand.ContentHash : cand.ContentHash)) { log("合并同包设备，安装后逐设备核验 / Shared package, verify each target after installation: " + cand.DeviceInstanceId); continue; }
 
                     if (!string.IsNullOrEmpty(cand.PackageId) && !System.Text.RegularExpressions.Regex.IsMatch(cand.PackageId, "^model-[a-f0-9]{64}$")) throw new InvalidDataException("Invalid model package identity");
                     string extractDir = Path.Combine(staging, string.IsNullOrEmpty(cand.PackageId) ? cand.ContentHash.Substring(0, Math.Min(8, cand.ContentHash.Length)) : cand.PackageId.Substring(0, 22));
@@ -2984,7 +3405,7 @@ namespace UDA
                     // and current OS; a rejection is logged with its precise reason, never a bare skip.
                     D revalDev; deviceById.TryGetValue(cand.DeviceInstanceId, out revalDev);
                     string revalCode;
-                    string revalWhy = RevalidateExtractedInf(infAbs, revalDev, _osTarget, out revalCode);
+                    string revalWhy = RevalidateCandidateInf(cand, infAbs, revalDev, out revalCode);
                     if (revalWhy != null)
                     {
                         if (string.Equals(revalCode, "CurrentDriverPreferred", StringComparison.OrdinalIgnoreCase))
@@ -2996,6 +3417,7 @@ namespace UDA
                 }
 
                 if (result.Cancelled) return result;
+                prepared = prepared.OrderBy(p => p.Candidate.IsExtension).ToList();
                 log("全部候选缓存完成，开始统一安装 / All packages cached; starting installation: " + prepared.Count);
                 // Phase 2: only after every downloadable package has been cached and verified, install them.
                 for (int i = 0; i < prepared.Count; i++)
@@ -3005,13 +3427,14 @@ namespace UDA
                     var cand = item.Candidate;
                     string infName = Path.GetFileName(cand.InfRelativePath ?? "");
                     ReportStep(progress, i + 1, prepared.Count, string.IsNullOrWhiteSpace(cand.FriendlyName) ? infName : cand.FriendlyName, "安装");
+                    if (!ExtensionParentReady(cand, deviceById, log)) { result.InstalledSkip++; continue; }
                     var rec = new InfRecord { Path = item.InfPath, ContentHash = cand.ContentHash, Class = cand.Class, ClassGuid = cand.ClassGuid,
                         DriverVerDate = cand.DriverVerDate, DriverVerVersion = cand.DriverVerVersion, Provider = cand.Provider,
                         HardwareIds = new List<string>(), CompatibleIds = new List<string>() };
                     var sum = DriverInstallExecutor.Execute(new List<InfRecord> { rec }, new List<string> { item.ExtractDir }, _config.DedupeByContent,
                         _config.WhatIf, _config.Deploy, _config.InstallTimeoutSeconds, _config.VerifySignature,
-                        _logger, _admin, _sig, _runner, _sys, abs => string.Equals(Sha256File(abs), cand.ContentHash, StringComparison.OrdinalIgnoreCase), null);
-                    if (!_config.WhatIf && (_runner == null || _runner is PnpInstallRunner))
+                        _logger, _admin, _sig, InstallationRunner(cand), _sys, abs => string.Equals(Sha256File(abs), cand.ContentHash, StringComparison.OrdinalIgnoreCase), null);
+                    if (!_config.WhatIf && !cand.UserSelectedVersion && !cand.IsExtension && (_runner == null || _runner is PnpInstallRunner))
                     {
                         foreach (var installItem in sum.Items)
                             LanPnpRejectionStore.RecordPnputilLatest(candidates, cand.ContentHash, installItem, deviceById, _osTarget, _logger);
@@ -3023,7 +3446,7 @@ namespace UDA
                     if (sum.Ok > 0) LanInstallReceiptStore.Mark(cand.DeviceInstanceId, cand.ContentHash);
                     if (!_config.WhatIf && (_runner == null || _runner is PnpInstallRunner))
                     {
-                        foreach (var shared in candidates.Where(x => x.DeviceInstanceId != cand.DeviceInstanceId && string.Equals(x.ContentHash, cand.ContentHash, StringComparison.OrdinalIgnoreCase)))
+                        foreach (var shared in candidates.Where(x => !cand.UserSelectedVersion && !cand.IsExtension && !x.IsExtension && !x.UserSelectedVersion && x.DeviceInstanceId != cand.DeviceInstanceId && string.Equals(x.ContentHash, cand.ContentHash, StringComparison.OrdinalIgnoreCase)))
                         {
                             var actual = new D { Id = shared.DeviceInstanceId };
                             bool bound = CurrentDriverState.RefreshDevice(actual, _logger) && !actual.Bad && LanInstalledPackage.MatchesCurrentInf(actual.Inf, shared.ContentHash);
@@ -3043,7 +3466,7 @@ namespace UDA
             finally
             {
                 SafeDeleteRunCacheDir(runDir, cacheRoot, log);
-                if (_logger != null) _logger.E -= capture;
+                if (captureInstallOnly && _logger != null) _logger.E -= capture;
                 try { lock (logGate) if (logBuffer.Length > 0) ClientTelemetryQueue.Enqueue(TelemetryDirectory, NewTelemetryEvent("log", logBuffer.ToString())); }
                 catch (Exception ex) { if (_logger != null) _logger.W("[WARN] 日志队列写入失败，详细日志仍保存在本机 / telemetry write failed: " + ex.Message); }
                 FlushTelemetry();
@@ -3055,7 +3478,7 @@ namespace UDA
         //  re-report and re-scan; keep auto-installing only candidates that match the original
         //  user selection / the recommended safe policy, until no candidate remains, at most
         //  MaxRounds rounds. Each DeviceInstanceId+ContentHash is processed at most once per
-        //  session (no infinite loops); every round honours cancellation and reports progress.
+        //  inventory state; dependency changes permit at most three attempts. Every round honours cancellation.
         // ---------------------------------------------------------------------------------
 
         /// <summary>Round budget for the controlled closed loop.</summary>
@@ -3066,9 +3489,20 @@ namespace UDA
             /// <summary>Maximum number of continuation rounds (default 5).</summary>
             public int MaxRounds = ClosedLoopMaxRounds;
             public bool AllowUpdates;
+            // Multiple quiet snapshots are necessary: bus drivers publish children asynchronously.
+            public int QuietPasses = 1;
+            public int QuietDelayMs;
+            public bool RescanBeforeCollection;
             /// <summary>Optional extra authorization filter applied to auto-continue candidates in
             /// addition to the built-in recommended safe policy. Null = policy only.</summary>
             public Func<LanCandidateDto, bool> ExtraCandidateFilter;
+        }
+
+        public sealed class LanCompletionProblem
+        {
+            public string DeviceInstanceId = "", FriendlyName = "", ReasonCode = "", Reason = "", CurrentInf = "", CurrentVersion = "";
+            public int ProblemCode;
+            public List<string> HardwareIds = new List<string>(), CompatibleIds = new List<string>();
         }
 
         public sealed class LanClosedLoopResult
@@ -3079,6 +3513,9 @@ namespace UDA
             public bool Reboot, Cancelled;
             public bool NoCandidatesRemaining;
             public bool StoppedAtMaxRounds;
+            public int RemainingProblemDevices;
+            public bool CompletionAudited;
+            public List<LanCompletionProblem> FinalProblems = new List<LanCompletionProblem>();
             public string Error = "";
             /// <summary>DeviceInstanceId|ContentHash keys processed this session (dedup guard).</summary>
             public List<string> ProcessedKeys = new List<string>();
@@ -3094,11 +3531,50 @@ namespace UDA
             if (!string.IsNullOrEmpty(c.LocalRejectionReason)) return false;
             D d;
             deviceById.TryGetValue(c.DeviceInstanceId, out d);
+            if (c.IsExtension)
+            {
+                if (!c.NeedInstall || d == null || LanExtensionPackages.Satisfied(c, d, _osTarget)) return false;
+                if (!opts.AllowUpdates && LanExtensionPackages.HasAppliedLineage(c, d)) return false;
+                if (_config.VerifySignature && string.Equals(c.SignatureStatus, "untrusted", StringComparison.OrdinalIgnoreCase)) return false;
+                return opts.ExtraCandidateFilter == null || opts.ExtraCandidateFilter(c);
+            }
             bool installType = d == null || d.Bad || string.IsNullOrEmpty(d.Inf) || string.IsNullOrEmpty(d.Version);
             if (!installType && !opts.AllowUpdates) return false;   // SCCM explicitly authorizes updates.
             if (!installType && !NeedsInstall(d, c.DriverVerVersion)) return false;
             if (_config.VerifySignature && string.Equals(c.SignatureStatus, "untrusted", StringComparison.OrdinalIgnoreCase)) return false;
             return opts.ExtraCandidateFilter == null || opts.ExtraCandidateFilter(c);
+        }
+
+        internal static string DeviceInventoryFingerprint(IEnumerable<D> devices)
+        {
+            return string.Join("\n", devices.Where(d => d != null).Select(d => d.Id + "|" + d.Error + "|" + d.Inf + "|" + d.Version + "|" +
+                string.Join(",", (d.H ?? new List<string>()).OrderBy(v => v, StringComparer.OrdinalIgnoreCase)) + "|" +
+                string.Join(",", (d.K ?? new List<string>()).OrderBy(v => v, StringComparer.OrdinalIgnoreCase)))
+                .OrderBy(v => v, StringComparer.OrdinalIgnoreCase));
+        }
+        private void AuditCompletion(LanClosedLoopResult result, IList<D> devices, LanReportResponse report, IEnumerable<LanCandidateDto> attempted, Action<string> log)
+        {
+            result.FinalProblems.Clear();
+            var tried = attempted.ToList();
+            foreach (var d in devices)
+            {
+                var candidates = (report.Candidates ?? new List<LanCandidateDto>()).Where(c => c.DeviceInstanceId == d.Id).ToList();
+                var previous = tried.Where(c => c.DeviceInstanceId == d.Id).ToList();
+                bool unresolved = d.NeedsAttention || previous.Any(c => c.IsExtension ? !LanExtensionPackages.Satisfied(c, d, _osTarget) :
+                    c.UserSelectedVersion ? !IsReceiptSuppressed(c, d) : candidates.Any(next => !next.IsExtension && next.NeedInstall));
+                if (!unresolved) continue;
+                var rejected = candidates.FirstOrDefault(c => !string.IsNullOrEmpty(c.LocalRejectionReason));
+                var missing = (report.UnmatchedDevices ?? new List<LanUnmatchedDeviceDto>()).FirstOrDefault(m => m.DeviceInstanceId == d.Id);
+                string code = rejected != null ? "CandidateRejected" : missing != null ? missing.ReasonCode : result.Reboot ? "RestartRequiredOrUnverified" : previous.Count > 0 ? "BindingNotConfirmed" : "NotInstalled";
+                string reason = rejected != null ? rejected.LocalRejectionReason : missing != null ? missing.Reason : "设备或所需配套驱动未核验完成；请查看安装记录";
+                result.FinalProblems.Add(new LanCompletionProblem { DeviceInstanceId = d.Id, FriendlyName = d.Name, ProblemCode = d.Error,
+                    CurrentInf = d.Inf, CurrentVersion = d.Version, HardwareIds = new List<string>(d.H ?? new List<string>()), CompatibleIds = new List<string>(d.K ?? new List<string>()), ReasonCode = code, Reason = reason });
+                log("最终未完成 / Final incomplete: " + d.Id + "; code=" + d.Error + "; reason=" + code + "; " + reason);
+            }
+            foreach (var c in tried.Where(c => !devices.Any(d => d.Id == c.DeviceInstanceId)).GroupBy(c => c.DeviceInstanceId).Select(g => g.First()))
+                result.FinalProblems.Add(new LanCompletionProblem { DeviceInstanceId = c.DeviceInstanceId, FriendlyName = c.FriendlyName, ReasonCode = "DeviceNotPresent", Reason = "目标设备未出现在最终硬件清单中" });
+            result.CompletionAudited = true;
+            log("最终核验 / Completion audit: devices=" + devices.Count + "; incomplete=" + result.FinalProblems.Count);
         }
 
         private static void AccumulateLoop(LanClosedLoopResult acc, LanClientResult res)
@@ -3119,12 +3595,19 @@ namespace UDA
         public LanClosedLoopResult RunControlledLoop(IList<LanCandidateDto> initialCandidates, CancellationToken ct,
             IProgress<LanInstallProgress> installProgress, IProgress<string> roundProgress, LanClosedLoopOptions options)
         {
+            BeginTelemetryRun(); Interlocked.Increment(ref _telemetryLoopDepth);
             var acc = new LanClosedLoopResult();
             var opts = options != null ? options : new LanClosedLoopOptions();
             int maxRounds = Math.Max(1, opts.MaxRounds);
+            int quietPasses = Math.Max(1, opts.QuietPasses), quietCount = 0, quietPolls = 0;
+            string quietInventory = null;
             Action<string> log = m => { acc.Log.Add(m); if (_logger != null) _logger.W("[INFO] " + m); };
             var processed = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             var processedModels = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var attempts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+            var attemptedInventory = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            var attemptedCandidates = new Dictionary<string, LanCandidateDto>(StringComparer.OrdinalIgnoreCase);
+            var explicitlySelectedDevices = new HashSet<string>((initialCandidates ?? new List<LanCandidateDto>()).Where(c => c != null && c.UserSelectedVersion).Select(c => c.DeviceInstanceId), StringComparer.OrdinalIgnoreCase);
             var collector = _hc ?? new WmiHardwareCollector();
             try
             {
@@ -3137,6 +3620,10 @@ namespace UDA
                         if (c != null && !string.IsNullOrEmpty(c.ContentHash) && processed.Add(CandidateKey(c.DeviceInstanceId, c.ContentHash)))
                             acc.ProcessedKeys.Add(CandidateKey(c.DeviceInstanceId, c.ContentHash));
                     var initialDevices = _lastReportedDevices ?? collector.Collect(_logger) ?? new List<D>();
+                    foreach (var c in initialCandidates.Where(c => c != null && !string.IsNullOrEmpty(c.ContentHash))) {
+                        string key = CandidateKey(c.DeviceInstanceId, c.ContentHash);
+                        attempts[key] = 1; attemptedInventory[key] = DeviceInventoryFingerprint(initialDevices); attemptedCandidates[key] = c;
+                    }
                     var res0 = InstallCandidates(initialCandidates, initialDevices, ct, installProgress);
                     AccumulateLoop(acc, res0);
                     foreach (var c in initialCandidates) if (c != null && !string.IsNullOrEmpty(c.PackageId)) processedModels.Add(c.PackageId);
@@ -3147,33 +3634,67 @@ namespace UDA
                 {
                     ct.ThrowIfCancellationRequested();
                     if (roundProgress != null) roundProgress.Report("第 " + round + "/" + maxRounds + " 轮：重新采集硬件并上报…");
+                    if (opts.RescanBeforeCollection && !_config.WhatIf && _sys != null) _sys.ScanDevices(60, _logger);
                     var devices = collector.Collect(_logger) ?? new List<D>();
                     if (ct.IsCancellationRequested) { acc.Cancelled = true; log("取消：第 " + round + " 轮采集后停止 / cancelled after round " + round + " collection"); break; }
                     LanReportResponse resp = Report(devices, _machine, ct, null);
                     var deviceById = devices.Where(d => !string.IsNullOrEmpty(d.Id)).ToDictionary(d => d.Id, StringComparer.OrdinalIgnoreCase);
+                    string currentInventory = DeviceInventoryFingerprint(devices);
                     var pending = resp.Candidates.Where(delegate(LanCandidateDto c)
                     {
                         if (c == null || string.IsNullOrEmpty(c.ContentHash)) return false;
+                        if (!c.IsExtension && explicitlySelectedDevices.Contains(c.DeviceInstanceId)) return false;
                         string key = CandidateKey(c.DeviceInstanceId, c.ContentHash);
                         if (!string.IsNullOrEmpty(c.PackageId) && processedModels.Contains(c.PackageId)) return false;
-                        if (processed.Contains(key)) return false;                        // same item already handled this session
                         D d;
                         deviceById.TryGetValue(c.DeviceInstanceId, out d);
+                        if (processed.Contains(key)) {
+                            int count; string previous;
+                            if ((c.IsExtension && (!attemptedInventory.TryGetValue(key, out previous) || previous == currentInventory)) ||
+                                !attempts.TryGetValue(key, out count) || count >= 3 ||
+                                (!c.IsExtension && (d == null || (!d.NeedsAttention && !string.IsNullOrEmpty(d.Inf) && !string.IsNullOrEmpty(d.Version)))) ) return false;
+                        }
                         if (IsReceiptSuppressed(c, d)) return false;                      // receipt only when actually in effect
                         return IsSafeAutoCandidate(c, deviceById, opts);
                     }).ToList();
                     if (pending.Count == 0)
                     {
-                        acc.NoCandidatesRemaining = true;
+                        string inventory = currentInventory;
+                        quietCount = string.Equals(quietInventory, inventory, StringComparison.Ordinal) ? quietCount + 1 : 1;
+                        quietInventory = inventory;
+                        quietPolls++;
+                        if (quietCount < quietPasses && quietPolls >= Math.Max(12, quietPasses))
+                        {
+                            acc.RemainingProblemDevices = devices.Count(d => d.NeedsAttention);
+                            acc.Error = "设备枚举持续变化，未确认部署完成 / PnP inventory did not settle";
+                            log(acc.Error);
+                            break;
+                        }
+                        if (quietCount < quietPasses)
+                        {
+                            log("等待设备枚举稳定 / Waiting for PnP enumeration: " + quietCount + "/" + quietPasses);
+                            if (ct.WaitHandle.WaitOne(Math.Max(0, opts.QuietDelayMs))) ct.ThrowIfCancellationRequested();
+                            round--; // Quiet polls do not consume an installation round.
+                            continue;
+                        }
+                        acc.RemainingProblemDevices = devices.Count(d => d.NeedsAttention);
+                        acc.NoCandidatesRemaining = !resp.Candidates.Any(c => c != null && (c.IsExtension || !explicitlySelectedDevices.Contains(c.DeviceInstanceId)) && (string.IsNullOrEmpty(c.PackageId) || !processedModels.Contains(c.PackageId)) && IsSafeAutoCandidate(c, deviceById, opts) && !IsReceiptSuppressed(c, deviceById.ContainsKey(c.DeviceInstanceId) ? deviceById[c.DeviceInstanceId] : null));
+                        AuditCompletion(acc, devices, resp, attemptedCandidates.Values, log);
+                        foreach (var remaining in devices.Where(d => d.Bad))
+                            log("安装后仍有异常设备 / Final device problem: " + remaining.Id + "; code=" + remaining.Error + "; INF=" + remaining.Inf + "; hardware=[" + string.Join(",", remaining.H.ToArray()) + "]");
                         log("第 " + round + " 轮无可自动继续安装的候选，结束自动安装；不表示被跳过的驱动已安装 / Round " + round + ": no safe unprocessed candidates; skipped drivers are not confirmed installed");
                         break;
                     }
+                    quietCount = 0; quietPolls = 0; quietInventory = null;
                     acc.Rounds++;
                     log("第 " + round + " 轮发现 " + pending.Count + " 个符合安全策略的候选 / Round " + round + ": " + pending.Count + " safe candidates");
                     foreach (var c in pending)
                     {
                         string key = CandidateKey(c.DeviceInstanceId, c.ContentHash);
                         if (processed.Add(key)) acc.ProcessedKeys.Add(key);
+                        int count; attempts.TryGetValue(key, out count); attempts[key] = count + 1;
+                        attemptedInventory[key] = currentInventory; attemptedCandidates[key] = c;
+                        if (count > 0) log("依赖状态变化后重试 / Retry after PnP dependency change / fresh scan: " + c.DeviceInstanceId + " attempt=" + (count + 1) + "/3");
                     }
                     if (roundProgress != null) roundProgress.Report("第 " + round + "/" + maxRounds + " 轮：安装 " + pending.Count + " 个新候选…");
                     var res = InstallCandidates(pending, devices, ct, installProgress);
@@ -3192,6 +3713,12 @@ namespace UDA
                 acc.Error = "closed loop error: " + ex.Message;
                 if (_logger != null) _logger.W("[ERROR] 闭环异常 / closed loop error: " + ex);
                 return acc;
+            }
+            finally {
+                if (_liveDiagnostics != null) PublishDiagnosticState(acc.Cancelled ? "cancelled" : !string.IsNullOrEmpty(acc.Error) ? "failed" :
+                    acc.CompletionAudited && !acc.StoppedAtMaxRounds && acc.FinalProblems.Count == 0 ? "completed" : "unverified",
+                    "rounds=" + acc.Rounds + "; audited=" + acc.CompletionAudited + "; incomplete=" + acc.FinalProblems.Count + "; reboot=" + acc.Reboot + "; error=" + acc.Error);
+                Interlocked.Decrement(ref _telemetryLoopDepth);
             }
         }
 
@@ -3330,6 +3857,7 @@ namespace UDA
         public static bool IsReceiptSuppressed(LanCandidateDto cand, D d)
         {
             if (cand == null || string.IsNullOrEmpty(cand.ContentHash)) return false;
+            if (cand.IsExtension) return false; // extensions have independent, live per-device verification
             // Live INF bytes, not an installation receipt, prove that this exact package is active.
             if (d == null || d.Bad || string.IsNullOrEmpty(d.Inf) || string.IsNullOrEmpty(d.Version)) return false;
             return LanInstalledPackage.MatchesCurrentInf(d.Inf, cand.ContentHash);
@@ -3359,6 +3887,20 @@ namespace UDA
         private void ConfirmInstalledBinding(LanCandidateDto cand, Sum sum, LanClientResult result, CancellationToken ct, Action<string> log)
         {
             if (sum.Ok <= 0 || _config.WhatIf || (_runner != null && !(_runner is PnpInstallRunner))) return;
+            if (cand.IsExtension)
+            {
+                var parent = (_lastReportedDevices ?? new List<D>()).FirstOrDefault(d => string.Equals(d.Id, cand.DeviceInstanceId, StringComparison.OrdinalIgnoreCase)) ??
+                    new D { Id = cand.DeviceInstanceId, H = new List<string> { cand.MatchedId } };
+                for (int attempt = 0; attempt < 3; attempt++)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    if (LanExtensionPackages.Satisfied(cand, parent, _osTarget)) { log("配套扩展核验通过 / Extension applied: " + cand.DeviceInstanceId + " ExtensionId=" + cand.ExtensionId + " INF=" + cand.InfRelativePath); return; }
+                    if (attempt < 2 && ct.WaitHandle.WaitOne(500)) ct.ThrowIfCancellationRequested();
+                }
+                result.InstalledUnverified += sum.Ok; sum.Ok = 0;
+                log("扩展包安装命令成功，但设备尚未报告应用此 ExtensionId，不计为完成 / Extension application not confirmed: " + cand.DeviceInstanceId + " " + cand.ExtensionId + (sum.Reboot ? "；需要重启后复核" : ""));
+                return;
+            }
             var actual = new D { Id = cand.DeviceInstanceId };
             bool read = false;
             for (int attempt = 0; attempt < 3; attempt++)
@@ -3375,19 +3917,50 @@ namespace UDA
             result.InstalledUnverified += sum.Ok;
             sum.Ok = 0;
             log("安装命令成功，但尚未确认候选驱动绑定，不计为已完成 / Binding not confirmed: " + cand.DeviceInstanceId +
-                " expected=" + cand.DriverVerVersion + " actual=" + (read ? actual.Inf + "/" + actual.Version + " problem=" + actual.Error : "设备状态不可读取") +
+                " expected=" + cand.DriverVerVersion + " actual=" + (read || actual.Bad ? actual.Inf + "/" + actual.Version + " problem=" + actual.Error : "设备状态不可读取") +
                 (sum.Reboot ? "；系统报告需要重启" : "；请检查设备状态或后续回退记录"));
         }
 
+        private IPnpInstallRunner InstallationRunner(LanCandidateDto candidate)
+        {
+            var runner = _runner ?? new PnpInstallRunner();
+            return candidate.UserSelectedVersion && !candidate.IsExtension ? new SelectedDeviceInstallRunner(runner as IPnpDeviceInstallRunner, candidate.DeviceInstanceId) : runner;
+        }
+        private bool ExtensionParentReady(LanCandidateDto candidate, Dictionary<string, D> devices, Action<string> log)
+        {
+            if (!candidate.IsExtension) return true;
+            D device;
+            if (!devices.TryGetValue(candidate.DeviceInstanceId, out device)) return false;
+            if (_runner == null || _runner is PnpInstallRunner) CurrentDriverState.RefreshDevice(device, _logger);
+            bool ready = !device.Bad && !string.IsNullOrEmpty(device.Inf);
+            if (!ready) log("配套扩展等待基础驱动完成 / Extension requires healthy base driver: " + candidate.DeviceInstanceId + " " + candidate.ExtensionId);
+            return ready;
+        }
+        private string RevalidateCandidateInf(LanCandidateDto candidate, string path, D device, out string reasonCode)
+        {
+            if (!candidate.IsExtension) return RevalidateExtractedInf(path, device, _osTarget, out reasonCode, null, null, candidate.UserSelectedVersion);
+            reasonCode = "ExtensionIdentityMismatch";
+            var actual = InfParser.Parse(path, "downloaded-extension");
+            if (!LanExtensionPackages.IsExtension(actual) || !string.Equals(actual.ExtensionId, candidate.ExtensionId, StringComparison.OrdinalIgnoreCase)) return "扩展 INF 的类别或 ExtensionId 与候选不一致";
+            if (device == null) return "扩展 INF 找不到目标设备";
+            var hardware = new List<string>(device.H ?? new List<string>()); var compatible = new List<string>(device.K ?? new List<string>());
+            HardwareIdNormalizer.AddSafeMatchingAliases(hardware, compatible, device.Id);
+            var verdict = InfApplicability.Evaluate(actual, _osTarget, hardware, compatible);
+            reasonCode = verdict.ReasonCode;
+            Guid extensionId;
+            if (!Guid.TryParse(actual.ExtensionId, out extensionId) || !LanExtensionPackages.MatchesExtensionTarget(actual, extensionId, verdict)) return "扩展 INF 不适用于当前设备/系统：" + verdict.Reason;
+            reasonCode = ""; return null;
+        }
         private bool ShouldInstall(LanCandidateDto cand, Dictionary<string, D> deviceById, out string reason)
         {
             D d;
             deviceById.TryGetValue(cand != null ? cand.DeviceInstanceId : "", out d);
-            if (LanPnpRejectionStore.Contains(cand, d, _osTarget))
+            if (cand != null && cand.IsExtension) { reason = LanInstallPolicy.Revalidate(cand, d, _osTarget, _config.VerifySignature); return reason == null; }
+            if (!cand.UserSelectedVersion && LanPnpRejectionStore.Contains(cand, d, _osTarget))
             { reason = "Windows 已确认当前驱动优先于此包；设备绑定、候选包或系统变化前不再重复尝试 / Windows previously retained the current driver"; return false; }
             if (IsReceiptSuppressed(cand, d)) { reason = "当前设备实际绑定的 INF 与候选完全一致 / exact candidate already bound"; return false; }
             reason = LanInstallPolicy.Revalidate(cand, d, _osTarget, _config.VerifySignature);
-            if (reason == null && IsOutrankedByCurrentDriver(cand, d,
+            if (reason == null && !cand.UserSelectedVersion && IsOutrankedByCurrentDriver(cand, d,
                 message => { if (_logger != null) _logger.W("[INFO] Driver Store rank / " + cand.DeviceInstanceId + " " + cand.InfRelativePath + ": " + message); }))
                 reason = "Windows 完整 Driver Store 排名判定候选不是唯一最佳适用驱动 / Windows full Driver Store ranking prefers another candidate";
             return reason == null;
@@ -3422,7 +3995,7 @@ namespace UDA
             return RevalidateExtractedInf(infAbs, d, target, out reasonCode, null);
         }
 
-        private static string RevalidateExtractedInf(string infAbs, D d, OsTarget target, out string reasonCode, Action<string> trace, DriverScanFiles files = null)
+        private static string RevalidateExtractedInf(string infAbs, D d, OsTarget target, out string reasonCode, Action<string> trace, DriverScanFiles files = null, bool explicitVersion = false)
         {
             reasonCode = "";
             if (string.IsNullOrEmpty(infAbs) || !File.Exists(infAbs))
@@ -3439,7 +4012,9 @@ namespace UDA
             var verdict = InfApplicability.Evaluate(parsed, target, hardwareIds, compatibleIds);
             if (verdict.Applicable)
             {
-                bool? better = WindowsDriverPreference.IsBetterForDevice(d, infAbs, trace, files);
+                if ((d.Bad || string.IsNullOrEmpty(d.Inf)) && WindowsDriverPreference.IsCompatibleWithDevice(d, infAbs, trace) == false)
+                { reasonCode = "WindowsNoCompatibleDriver"; return "Windows 未将候选列为该设备的兼容驱动 / Windows found no compatible driver in candidate INF"; }
+                bool? better = explicitVersion ? (bool?)null : WindowsDriverPreference.IsBetterForDevice(d, infAbs, trace, files);
                 if (trace != null) trace("candidate selection verdict=" + (better.HasValue ? better.Value.ToString() : "unknown"));
                 if (better == false)
                 { reasonCode = "CurrentDriverPreferred"; return "Windows 排名/日期/版本判定现有驱动更优或等效 / current driver outranks candidate"; }

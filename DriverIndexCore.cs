@@ -1,4 +1,4 @@
-﻿// DriverIndexCore.cs — Phase 1: offline high-performance driver index core.
+// DriverIndexCore.cs — Phase 1: offline high-performance driver index core.
 // Compiled by the in-box CSharpCodeProvider (C# 5.0). No third-party dependencies.
 // See README "Phase 1 / 驱动索引核心" for the SQLite-vs-BCL-store decision and file format.
 using System;
@@ -18,11 +18,18 @@ namespace UDA
     //  Data records
     // =================================================================================
 
+    public sealed class InfModelSection
+    {
+        public string Group = "";
+        public string Decoration = "";
+    }
+
     /// <summary>One model line parsed from a [Models*] section of an INF.</summary>
     public sealed class InfModelEntry
     {
         public string Description = "";
         public string InstallSection = "";
+        public string ModelGroup = "";
         public string Decoration = ""; // e.g. "NTamd64.10" or "" for the bare/universal section
         public List<string> HardwareIds = new List<string>();
         public List<string> CompatibleIds = new List<string>();
@@ -37,12 +44,14 @@ namespace UDA
         public string Manufacturer = "";
         public string Class = "";
         public string ClassGuid = "";
+        public string ExtensionId = "";
         public string DriverVerDate = "";
         public string DriverVerVersion = "";
         public string Fingerprint = "";  // quick key: "len|mtimeUtcTicks"
         public string ContentHash = "";  // SHA-256 hex of file bytes
         public List<string> Decorations = new List<string>();
         public List<InfModelEntry> Models = new List<InfModelEntry>();
+        public List<InfModelSection> ModelSections = new List<InfModelSection>();
         // Aggregated, normalized IDs across all model lines (deduplicated).
         public List<string> HardwareIds = new List<string>();
         public List<string> CompatibleIds = new List<string>();
@@ -183,7 +192,10 @@ namespace UDA
     {
         public static InfRecord Parse(string path, string sourceName)
         {
-            byte[] bytes = File.ReadAllBytes(path);
+            return ParseBytes(File.ReadAllBytes(path), path, sourceName);
+        }
+        public static InfRecord ParseBytes(byte[] bytes, string path, string sourceName)
+        {
             string text = DecodeInfText(bytes);
             var record = new InfRecord();
             record.Path = Path.GetFullPath(path);
@@ -205,6 +217,8 @@ namespace UDA
                 record.Provider = Resolve(GetValue(version, "Provider"), strings);
                 record.Class = GetValue(version, "Class").Trim();
                 record.ClassGuid = NormalizeClassGuid(GetValue(version, "ClassGuid"));
+                Guid extension;
+                if (Guid.TryParse(GetValue(version, "ExtensionId").Trim().Trim('"'), out extension) && extension != Guid.Empty) record.ExtensionId = extension.ToString("B");
                 string dv = GetValue(version, "DriverVer");
                 ParseDriverVer(dv, record);
             }
@@ -253,11 +267,14 @@ namespace UDA
                 Section sec;
                 if (!sections.TryGetValue(modelSection.Key, out sec)) continue;
                 string decoration = modelSection.Value;
+                string group = decoration.Length == 0 ? modelSection.Key : modelSection.Key.Substring(0, modelSection.Key.Length - decoration.Length - 1);
+                record.ModelSections.Add(new InfModelSection { Group = group, Decoration = decoration });
                 if (decSeen.Add(decoration)) record.Decorations.Add(decoration);
                 foreach (var kv in sec.Entries)
                 {
                     var entry = ParseModelLine(kv.Key, kv.Value, decoration, strings);
                     if (entry == null) continue;
+                    entry.ModelGroup = group;
                     record.Models.Add(entry);
                     foreach (var id in entry.HardwareIds) if (hwSeen.Add(id)) record.HardwareIds.Add(id);
                     foreach (var id in entry.CompatibleIds) if (cmpSeen.Add(id)) record.CompatibleIds.Add(id);

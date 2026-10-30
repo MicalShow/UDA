@@ -1,4 +1,4 @@
-param([string]$OutputDirectory='release-v5.0.4',[switch]$NativeSmoke)
+﻿param([string]$OutputDirectory='release-v5.0.4',[switch]$NativeSmoke)
 $ErrorActionPreference='Stop'
 [void][Reflection.Assembly]::LoadFrom((Join-Path $PSScriptRoot ($OutputDirectory+'\Lan\UDA-Server-Manager.exe')))
 $old=[datetime]'1968-07-18';$new=[datetime]'2022-04-11';$rank=[uint32]0x00FF2001

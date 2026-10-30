@@ -656,8 +656,8 @@ namespace UDA
             machineName.Text = (value.Maker + "  " + value.Model).Trim();
             machineMeta.Text = "System SKU: " + value.Sku + "    序列号: " + value.Serial + "    " + value.OS;
             allCount.Text = value.Devices.Count.ToString();
-            problemCount.Text = value.Devices.Count(x => x.Bad).ToString();
-            int bad = value.Devices.Count(x => x.Bad);
+            problemCount.Text = value.Devices.Count(x => x.NeedsAttention).ToString();
+            int bad = value.Devices.Count(x => x.NeedsAttention);
             hardwareHealth.Text = bad == 0 ? "● 硬件状态良好" : ("● 发现 " + bad + " 个异常设备");
             hardwareHealth.ForeColor = bad == 0 ? Color.FromArgb(42, 166, 103) : Color.FromArgb(230, 84, 73);
 
@@ -665,12 +665,12 @@ namespace UDA
             foreach (string[] item in value.Info) detailsGrid.Rows.Add(item[0] + " · " + item[1], item[2]);
 
             hardwareGrid.Rows.Clear();
-            foreach (D device in value.Devices.OrderByDescending(x => x.Bad).ThenBy(x => x.Class).ThenBy(x => x.Name))
+            foreach (D device in value.Devices.OrderByDescending(x => x.NeedsAttention).ThenBy(x => x.Class).ThenBy(x => x.Name))
             {
-                int index = hardwareGrid.Rows.Add(device.Bad ? "异常" : "正常", device.Name, device.Class, device.Maker, device.Error,
+                int index = hardwareGrid.Rows.Add(device.Error == 22 ? "已禁用" : device.Error == 45 ? "未连接" : device.NeedsAttention ? "异常" : "正常", device.Name, device.Class, device.Maker, device.Error,
                     string.Join(Environment.NewLine, device.H), device.Inf, device.Version);
                 hardwareGrid.Rows[index].Tag = device;
-                if (device.Bad) hardwareGrid.Rows[index].DefaultCellStyle.ForeColor = Color.FromArgb(200, 60, 60);
+                if (device.NeedsAttention) hardwareGrid.Rows[index].DefaultCellStyle.ForeColor = Color.FromArgb(200, 60, 60);
             }
         }
 

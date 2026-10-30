@@ -1,4 +1,4 @@
-param([string]$OutputDirectory = 'release-v4.8.8')
+﻿param([string]$OutputDirectory = 'release-v4.8.8')
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Windows.Forms
 $assembly = [Reflection.Assembly]::LoadFrom((Join-Path $PSScriptRoot ($OutputDirectory + '\Lan\UDA-Server-Manager.exe')))

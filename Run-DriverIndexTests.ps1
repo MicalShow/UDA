@@ -1,4 +1,4 @@
-<# .SYNOPSIS 编译并运行第一阶段驱动索引核心测试 / Compile & run the Phase 1 driver index core tests. #>
+﻿<# .SYNOPSIS 编译并运行第一阶段驱动索引核心测试 / Compile & run the Phase 1 driver index core tests. #>
 [CmdletBinding()]param([string]$OutputDirectory)
 Set-StrictMode -Version 2.0;$ErrorActionPreference='Stop';$root=Split-Path -Parent $MyInvocation.MyCommand.Path
 if([string]::IsNullOrWhiteSpace($OutputDirectory)){$OutputDirectory=Join-Path $root 'driver-index-test-results'}

@@ -1,4 +1,4 @@
-param([string]$OutputDirectory = 'web-console-organized')
+﻿param([string]$OutputDirectory = 'web-console-organized')
 $ErrorActionPreference = 'Stop'
 [void][Reflection.Assembly]::LoadFrom((Join-Path $PSScriptRoot ($OutputDirectory + '\Lan\UDA-Server-Manager.exe')))
 $root = Join-Path $PSScriptRoot ($OutputDirectory + '\organized-test-' + [Guid]::NewGuid().ToString('N'))

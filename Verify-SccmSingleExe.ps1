@@ -1,4 +1,4 @@
-param([string]$OutputDirectory = 'web-console-sccm-verified')
+﻿param([string]$OutputDirectory = 'web-console-sccm-verified')
 $ErrorActionPreference='Stop'
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 $root=Join-Path $PSScriptRoot ($OutputDirectory+'\sccm-launcher-'+[Guid]::NewGuid().ToString('N'))

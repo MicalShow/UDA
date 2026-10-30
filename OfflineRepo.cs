@@ -1,4 +1,4 @@
-﻿// OfflineRepo.cs - Phase 3A: self-contained, removable offline driver repository.
+// OfflineRepo.cs - Phase 3A: self-contained, removable offline driver repository.
 //
 // Built on the Phase 1 index core (InfParser / DriverIndex / MatchRanker) and the Phase 2 install
 // seams (IAdminChecker / ISignatureVerifier / IPnpInstallRunner / ISystemOps / IHardwareCollector).
@@ -62,6 +62,7 @@ namespace UDA
         // from the INF itself in that case. Excluded from ComputeIntegrityHash: the entries are
         // derived from the INF whose ContentHash is already pinned above.
         public List<InfModelEntry> Models;
+        public List<InfModelSection> ModelSections;
         public string PackageRoot = "", PackageHash = "";
         public string SourceIdentity = "";
         public long Size;
@@ -713,6 +714,7 @@ namespace UDA
                 if (knownRoots.Count > 0) packages.AddRange(knownRoots); else packages.AddRange(PackageUnits(directory, ct));
             }
             int number = 0;
+            var plannedTargets = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (string root in packages)
             {
                 ct.ThrowIfCancellationRequested();
@@ -724,7 +726,8 @@ namespace UDA
                 string prefix = "packages/" + category + "/";
                 string newRelative = oldRelative.StartsWith(prefix, StringComparison.OrdinalIgnoreCase) || oldRelative == prefix.TrimEnd('/') ? oldRelative : prefix + "pkg-" + hash.Substring(0, 24);
                 string target = SafeAbsolute(repoDir, newRelative);
-                if (!string.Equals(root, target, StringComparison.OrdinalIgnoreCase) && Directory.Exists(target)) newRelative += "-" + Guid.NewGuid().ToString("N");
+                if (!string.Equals(root, target, StringComparison.OrdinalIgnoreCase) && (Directory.Exists(target) || plannedTargets.Contains(newRelative))) newRelative += "-" + Guid.NewGuid().ToString("N").Substring(0, 12);
+                plannedTargets.Add(newRelative);
                 foreach (var entry in entries) { string oldPath = entry.RelativePath; entry.RelativePath = newRelative + entry.RelativePath.Substring(oldRelative.Length); entry.PackageRoot = newRelative; entry.PackageHash = hash; if (entry.RelativePath != oldPath) aliases[oldPath] = entry.RelativePath; }
                 manifest.HiddenPaths = (manifest.HiddenPaths ?? new List<string>()).Select(p => p.StartsWith(oldRelative + "/", StringComparison.OrdinalIgnoreCase) ? newRelative + p.Substring(oldRelative.Length) : p).ToList();
                 if (!string.Equals(oldRelative, newRelative, StringComparison.OrdinalIgnoreCase)) journal.Moves.Add(new[] { oldRelative, newRelative });
@@ -817,7 +820,7 @@ namespace UDA
             string identity = (entry.SourceName ?? "").StartsWith("Machine-", StringComparison.OrdinalIgnoreCase) ? "machine|" + entry.PackageRoot + "|" + entry.PackageHash : (entry.RelativePath ?? "") + "|" + (entry.ContentHash ?? "") + "|" + (entry.PackageHash ?? "");
             string hash;
             using (var sha = SHA256.Create()) hash = BitConverter.ToString(sha.ComputeHash(Encoding.UTF8.GetBytes(identity))).Replace("-", "").ToLowerInvariant();
-            return Path.Combine(Path.GetFullPath(repoDir), ".uda-downloads", hash + ".zip");
+            return ServerStorage.ResolveOnlineArchive(repoDir, hash + ".zip");
         }
 
         /// <summary>Prepare an uncompressed, per-INF ZIP once during server installation or repo update.
@@ -1241,7 +1244,7 @@ namespace UDA
                         RelativePath = rel, SourceName = source, ContentHash = rec.ContentHash,
                         Provider = rec.Provider, Manufacturer = rec.Manufacturer, Class = rec.Class,
                         ClassGuid = rec.ClassGuid, DriverVerDate = rec.DriverVerDate,
-                        DriverVerVersion = rec.DriverVerVersion, Decorations = new List<string>(rec.Decorations),
+                        DriverVerVersion = rec.DriverVerVersion, Decorations = new List<string>(rec.Decorations), ModelSections = new List<InfModelSection>(rec.ModelSections),
                         HardwareIds = new List<string>(rec.HardwareIds), CompatibleIds = new List<string>(rec.CompatibleIds),
                         Models = rec.Models != null ? new List<InfModelEntry>(rec.Models) : new List<InfModelEntry>(),
                         Size = new FileInfo(inf).Length
@@ -1465,13 +1468,13 @@ namespace UDA
                 ClassGuid = rec.ClassGuid,
                 DriverVerDate = rec.DriverVerDate,
                 DriverVerVersion = rec.DriverVerVersion,
-                Decorations = new List<string>(rec.Decorations),
+                Decorations = new List<string>(rec.Decorations), ModelSections = new List<InfModelSection>(rec.ModelSections),
                 HardwareIds = new List<string>(rec.HardwareIds),
                 CompatibleIds = new List<string>(rec.CompatibleIds),
                 Models = rec.Models != null && rec.Models.Count > 0
                     ? rec.Models.Select(m => new InfModelEntry
                     {
-                        Description = m.Description, InstallSection = m.InstallSection, Decoration = m.Decoration,
+                        Description = m.Description, InstallSection = m.InstallSection, Decoration = m.Decoration, ModelGroup = m.ModelGroup,
                         HardwareIds = new List<string>(m.HardwareIds), CompatibleIds = new List<string>(m.CompatibleIds)
                     }).ToList()
                     : new List<InfModelEntry>(),
@@ -1568,7 +1571,7 @@ namespace UDA
                 DriverVerDate = e.DriverVerDate,
                 DriverVerVersion = e.DriverVerVersion,
                 ContentHash = e.ContentHash,
-                Decorations = new List<string>(e.Decorations),
+                Decorations = new List<string>(e.Decorations), ModelSections = e.ModelSections != null ? new List<InfModelSection>(e.ModelSections) : new List<InfModelSection>(),
                 HardwareIds = new List<string>(e.HardwareIds),
                 CompatibleIds = new List<string>(e.CompatibleIds),
                 Models = e.Models != null ? new List<InfModelEntry>(e.Models) : new List<InfModelEntry>()
@@ -1936,6 +1939,8 @@ namespace UDA
                             var parsed = InfParser.Parse(abs, e.SourceName);
                             rec.Models = parsed.Models != null ? parsed.Models : new List<InfModelEntry>();
                             rec.Decorations = parsed.Decorations;
+                            rec.ModelSections = parsed.ModelSections;
+                            e.ModelSections = parsed.ModelSections;
                             e.Models = rec.Models;
                             e.Decorations = rec.Decorations;
                             if (unresolvedIds || invalidDecoration)
@@ -2024,7 +2029,7 @@ namespace UDA
             {
                 Path = e.RelativePath, SourceName = e.SourceName, Provider = e.Provider, Manufacturer = e.Manufacturer,
                 Class = e.Class, ClassGuid = e.ClassGuid, DriverVerDate = e.DriverVerDate, DriverVerVersion = e.DriverVerVersion,
-                ContentHash = e.ContentHash, Decorations = new List<string>(e.Decorations),
+                ContentHash = e.ContentHash, Decorations = new List<string>(e.Decorations), ModelSections = e.ModelSections != null ? new List<InfModelSection>(e.ModelSections) : new List<InfModelSection>(),
                 HardwareIds = new List<string>(e.HardwareIds), CompatibleIds = new List<string>(e.CompatibleIds),
                 Models = e.Models != null ? new List<InfModelEntry>(e.Models) : new List<InfModelEntry>()
             };
@@ -2267,7 +2272,7 @@ namespace UDA
             {
                 Path = abs, SourceName = e.SourceName, Provider = e.Provider, Manufacturer = e.Manufacturer,
                 Class = e.Class, ClassGuid = e.ClassGuid, DriverVerDate = e.DriverVerDate, DriverVerVersion = e.DriverVerVersion,
-                ContentHash = e.ContentHash, Decorations = new List<string>(e.Decorations),
+                ContentHash = e.ContentHash, Decorations = new List<string>(e.Decorations), ModelSections = e.ModelSections != null ? new List<InfModelSection>(e.ModelSections) : new List<InfModelSection>(),
                 HardwareIds = new List<string>(e.HardwareIds), CompatibleIds = new List<string>(e.CompatibleIds),
                 Models = e.Models != null ? new List<InfModelEntry>(e.Models) : new List<InfModelEntry>()
             };

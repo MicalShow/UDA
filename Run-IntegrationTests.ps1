@@ -1,4 +1,4 @@
-<# .SYNOPSIS 编译并运行第二阶段集成测试 / Compile & run the Phase 2 integration tests.
+﻿<# .SYNOPSIS 编译并运行第二阶段集成测试 / Compile & run the Phase 2 integration tests.
 .DESCRIPTION
   端到端验证驱动索引核心接入主引擎：硬件采集可测试抽象、包作用域过滤、从索引扫描到安装计划的
   全流程、退出码分类、白名单与去重、签名/管理员闸门、取消、配置向后兼容。全程离线，不调用

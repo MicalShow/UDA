@@ -1,4 +1,4 @@
-﻿// LanEditionForm.cs - LAN edition UI built on the ResponsiveForm visual baseline.
+// LanEditionForm.cs - LAN edition UI built on the ResponsiveForm visual baseline.
 //
 // Replaces the old LanClientForm (deleted). Rather than a second visual implementation, this subclasses
 // ResponsiveForm and reuses its entire shell verbatim: dark left navigation, top title/status/action
@@ -53,6 +53,13 @@ namespace UDA
         private int _lanRunGeneration;
         private readonly bool _previewMode;
 
+        private System.Windows.Forms.Timer _overviewRefreshTimer;
+        private bool _overviewRefreshing;
+        private CheckBox _showHiddenDevices;
+        private Label _releaseStatus;
+        private string _serverVersionText = "--", _repositoryDateText = "--";
+
+        private IDisposable _clientDiagnostics;
         private Panel _serverPage;
         private TextBox _serverUrlBox;
         private Button _serverLockBtn;
@@ -68,6 +75,8 @@ namespace UDA
         {
             _previewMode = previewMode;
             AddTransferColumns();
+            driversGrid.Columns.Add(new DataGridViewButtonColumn { Name = "ChooseVersion", HeaderText = "驱动版本", Width = 150, ReadOnly = true });
+            driversGrid.CellContentClick += ChooseDriverVersion;
             Text = "万能驱动助手-局域网络版";
             scanButton.Text = "扫描驱动";
             fullPackageCheck.Visible = false;   // LAN has no model-package concept; hide the legacy checkbox.
@@ -86,8 +95,95 @@ namespace UDA
             BuildServerPage();
             AddServerNav();
             LoadSettings();
+            if (!previewMode) _clientDiagnostics = _lanClient.StartLiveDiagnostics("interactive", false);
+            BuildClientTools();
+            if (!previewMode)
+            {
+                _overviewRefreshTimer = new System.Windows.Forms.Timer { Interval = 10000 };
+                _overviewRefreshTimer.Tick += async delegate { _overviewRefreshTimer.Interval = 10000; await RefreshOverviewAsync(); };
+                Shown += delegate { _overviewRefreshTimer.Start(); };
+                FormClosed += delegate { _overviewRefreshTimer.Stop(); _overviewRefreshTimer.Dispose(); _overviewRefreshTimer = null; };
+            }
             if (!previewMode) FormClosed += delegate { SaveSettings(); if (_lanCts != null) try { _lanCts.Cancel(); } catch { } };
         }
+
+        private async Task RefreshOverviewAsync()
+        {
+            if (_overviewRefreshing || _lanScanning || _lanInstalling || machine == null || IsDisposed) return;
+            _overviewRefreshing = true;
+            int generation = _lanRunGeneration;
+            try
+            {
+                var current = await LoadMachineAsync();
+                if (IsDisposed || _lanScanning || _lanInstalling || generation != _lanRunGeneration) return;
+                Func<Machine, string> fingerprint = value => string.Join("\n", value.Devices.Select(d => d.Id + "|" + d.Error + "|" + d.Inf + "|" + d.Version + "|" + d.Name).OrderBy(id => id, StringComparer.OrdinalIgnoreCase).ToArray());
+                if (fingerprint(machine) == fingerprint(current)) return;
+                machine = current;
+                FillHardware(machine);
+            }
+            catch (Exception ex) { if (!IsDisposed) logger.W("[WARN] 概览状态刷新失败，保留上次硬件状态：" + ex.Message); }
+            finally { _overviewRefreshing = false; }
+        }
+        protected override void OnActivated(EventArgs e)
+        {
+            base.OnActivated(e);
+            ScheduleOverviewRefresh();
+        }
+        protected override void WndProc(ref Message m)
+        {
+            base.WndProc(ref m);
+            if (m.Msg == 0x0219) ScheduleOverviewRefresh(); // WM_DEVICECHANGE
+        }
+        private void ScheduleOverviewRefresh()
+        {
+            if (_overviewRefreshTimer == null || IsDisposed) return;
+            _overviewRefreshTimer.Stop(); _overviewRefreshTimer.Interval = 600; _overviewRefreshTimer.Start();
+        }
+        internal Task TestRefreshOverviewAsync() { return RefreshOverviewAsync(); }
+        internal string TestOverviewHealth { get { return hardwareHealth.Text; } }
+        internal string TestOverviewProblems { get { return problemCount.Text; } }
+
+        private void BuildClientTools()
+        {
+            _showHiddenDevices = new CheckBox { Text = "显示隐藏设备", AutoSize = true, Margin = new Padding(8, 8, 8, 0), ForeColor = muted };
+            _showHiddenDevices.CheckedChanged += delegate { if (scanResult != null) FillDrivers(); };
+            driverTools.WrapContents = true;
+            driverTools.AutoScroll = true;
+            driverTools.Controls.Add(_showHiddenDevices);
+            var deviceManager = NewActionButton("设备管理器", false, 110);
+            deviceManager.Margin = new Padding(8, 3, 0, 0);
+            deviceManager.Click += delegate {
+                try { System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo { FileName = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "mmc.exe"), Arguments = "devmgmt.msc", UseShellExecute = true }); }
+                catch (Exception ex) { LanInfo("无法打开设备管理器：" + ex.Message, "设备管理器", MessageBoxIcon.Warning); }
+            };
+            driverTools.Controls.Add(deviceManager);
+            footerLayout.RowCount = 2;
+            footerLayout.Padding = new Padding(12, 2, 12, 2);
+            footerLayout.RowStyles.Clear();
+            footerLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 50));
+            footerLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 50));
+            _releaseStatus = new Label { Dock = DockStyle.Fill, AutoEllipsis = true, TextAlign = ContentAlignment.MiddleRight, ForeColor = muted, Font = new Font("Microsoft YaHei UI", 8F), Margin = Padding.Empty };
+            footerLayout.Controls.Add(_releaseStatus, 0, 1); footerLayout.SetColumnSpan(_releaseStatus, 3);
+            UpdateReleaseStatus();
+            ApplyResponsiveRules();
+        }
+        private void UpdateReleaseStatus()
+        {
+            if (_releaseStatus != null) _releaseStatus.Text = "客户端 " + LanProtocol.ServerVersion + "  ·  服务端 " + _serverVersionText + "  ·  仓库更新 " + _repositoryDateText;
+        }
+        private async Task<LanHealth> ProbeServerAsync(CancellationToken ct)
+        {
+            LanHealth health = null;
+            try { health = await Task.Run(delegate { return _lanClient.Probe(ct); }); }
+            catch (OperationCanceledException) { return null; }
+            catch { }
+            if (!IsDisposed && !ct.IsCancellationRequested) UpdateServerStatus(health);
+            return health;
+        }
+        internal void TestShowHiddenDevices(bool show) { _showHiddenDevices.Checked = show; }
+        internal string TestReleaseStatus { get { return _releaseStatus.Text; } }
+        internal string TestConnectionStatus { get { return sourceStatus.Text; } }
+        internal void TestServerHealth(LanHealth health) { UpdateServerStatus(health); }
 
         // ----- startup: read hardware only, do not auto-scan (the user must connect first) -----
 
@@ -96,13 +192,14 @@ namespace UDA
             ApplyScreenSafeBounds();
             logger.W("[INFO] UDA 客户端版本 / Client version: " + LanProtocol.ServerVersion + "；硬件上报超时 / report timeout: 120 seconds");
             var actualTarget = ResolveOsTarget(config);
+            logger.W("[INFO] 单驱动安装超时 / Driver install timeout: " + _lanCfg.InstallTimeoutSeconds + " seconds");
             logger.W("[INFO] 匹配系统参数 / Match OS target: arch=" + actualTarget.Architecture + " major=" + actualTarget.MajorVersion + " build=" + actualTarget.BuildNumber);
             headerStatus.Text = "正在读取本机硬件信息…";
             try
             {
                 machine = await Task.Run(delegate { var value = WM.Get(logger); HardwareProbe.Enrich(value, logger); return value; });
                 FillHardware(machine);
-                sourceStatus.Text = "服务器：" + CurrentServerUrl() + " · 尚未连接";
+                sourceStatus.Text = "尚未连接服务器";
                 headerStatus.Text = "正在自动扫描驱动…";
                 footerStatus.Text = "就绪";
                 ShowPage(homePage);
@@ -139,6 +236,8 @@ namespace UDA
             EnterLanBusyUi(false);
             headerStatus.Text = "正在连接服务器并扫描匹配候选…";
             footerStatus.Text = "扫描驱动";
+            sourceStatus.Text = "正在连接服务器…";
+            var initialProbe = ProbeServerAsync(ct);
             try
             {
                 bool automaticRetryAllowed = _firstAutomaticScan;
@@ -152,14 +251,15 @@ namespace UDA
                 IProgress<string> step = new Progress<string>(delegate(string m) { Ui(delegate { footerStatus.Text = m; }); });
                 var boot = await Task.Run(delegate { return _lanClient.Bootstrap(machine.Devices, ct, step); });
                 if (boot.BootstrapAttempted) logger.W("[INFO] 网卡引导 / NIC bootstrap: ok=" + boot.BootstrapOk + " fail=" + boot.BootstrapFail);
-                LanHealth health = await Task.Run(delegate { return _lanClient.Probe(ct); });
+                LanHealth health = await initialProbe;
+                if (health == null) health = await ProbeServerAsync(ct);
                 if (health == null) throw new Exception("无法连接服务器 " + url + "，请检查地址与网络");
                 for (int wait = 0; wait < 30 && (!health.RepoLoaded || health.ImportRunning); wait++)
                 {
                     ct.ThrowIfCancellationRequested();
                     footerStatus.Text = health.ImportRunning ? "服务器正在更新驱动仓库，等待完成…" : "服务器正在加载驱动仓库…";
                     await Task.Delay(1000, ct);
-                    health = await Task.Run(delegate { return _lanClient.Probe(ct); });
+                    health = await ProbeServerAsync(ct);
                     if (health == null) throw new Exception("等待仓库就绪时与服务器断开连接");
                 }
                 if (!health.RepoLoaded) throw new Exception("服务器驱动仓库尚未加载完成，请稍后重试");
@@ -182,7 +282,7 @@ namespace UDA
                 int picked = scanResult.Matches.Count(x => x.Pick);
                 int noMatch = scanResult.Matches.Count(x => x.State == "没有匹配驱动");
                 headerStatus.Text = "扫描完成 · 可安装/更新 " + picked + " 项" + (noMatch > 0 ? " · " + noMatch + " 个设备没有匹配驱动" : "");
-                sourceStatus.Text = "服务器：" + url + " · " + (health.RepoLoaded ? (health.InfCount + " 个驱动") : "仓库未加载");
+                sourceStatus.Text = "已连接服务器";
                 matchCount.Text = picked.ToString();
                 deploymentState.Text = "LAN 匹配";
                 footerStatus.Text = "可安装/更新 " + picked + " 项" + (noMatch > 0 ? "，" + noMatch + " 个设备没有匹配驱动" : "");
@@ -272,11 +372,12 @@ namespace UDA
                 // user-confirmed picks; continuation rounds (max 5) re-collect → re-report → re-scan and
                 // install only NEW, recommended-safe (install-type, trusted) candidates, deduped by
                 // device+content, cancellable via the same token, with cumulative totals.
-                var loop = await Task.Run(delegate { return _lanClient.RunControlledLoop(picked, ct, prog, roundProg, null); });
-                string msg = "完成：成功 " + loop.InstalledOk + "，跳过 " + loop.InstalledSkip + "，失败 " + loop.InstalledFail
+                var loop = await Task.Run(delegate { return _lanClient.RunControlledLoop(picked, ct, prog, roundProg, Phase3Dispatch.InteractiveLoopOptions()); });
+                string msg = "结束：成功 " + loop.InstalledOk + "，跳过 " + loop.InstalledSkip + "，失败 " + loop.InstalledFail
                     + (loop.InstalledUnverified > 0 ? "，绑定待确认 " + loop.InstalledUnverified : "")
                     + (loop.Downloaded > 0 ? "，下载 " + loop.Downloaded : "")
                     + (loop.Rounds > 0 ? "（含闭环 " + loop.Rounds + " 轮）" : "")
+                    + (loop.FinalProblems.Count > 0 ? " · 仍有 " + loop.FinalProblems.Count + " 项未完成" : "")
                     + (loop.StoppedAtMaxRounds ? " · 已达最大轮数" : "")
                     + (loop.Cancelled ? " · 已取消" : "") + (loop.Reboot ? " · 需重启" : "");
                 if (!string.IsNullOrEmpty(loop.Error) && loop.Error != "cancelled") msg += " · " + loop.Error;
@@ -285,7 +386,7 @@ namespace UDA
                 // current candidate list and avoid an unnecessary second server scan while offline.
                 // Refresh after installs, already-current skips, or unverified bindings only.
                 refreshList = !loop.Cancelled && (loop.InstalledOk > 0 || loop.InstalledSkip > 0 || loop.InstalledUnverified > 0);
-                LanInfo(msg, "安装结果", (loop.InstalledFail > 0 || loop.InstalledUnverified > 0 || loop.Cancelled) ? MessageBoxIcon.Warning : MessageBoxIcon.Information);
+                LanInfo(msg, "安装结果", (loop.FinalProblems.Count > 0 || loop.InstalledFail > 0 || loop.InstalledUnverified > 0 || loop.StoppedAtMaxRounds || loop.Cancelled) ? MessageBoxIcon.Warning : MessageBoxIcon.Information);
             }
             catch (OperationCanceledException)
             {
@@ -332,6 +433,70 @@ namespace UDA
                 driversGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = spec.Item1, HeaderText = spec.Item2, Width = spec.Item3,
                     ReadOnly = true, SortMode = DataGridViewColumnSortMode.NotSortable, AutoSizeMode = DataGridViewAutoSizeColumnMode.None });
             }
+        }
+
+        protected override void FillDrivers()
+        {
+            base.FillDrivers();
+            if (scanResult != null && !scanResult.Matches.Any(x => x.Pick) && driverSummaryTitle != null) driverSummaryTitle.Text = "暂无可安装或更新的驱动";
+            driversGrid.CurrentCell = null;
+            foreach (DataGridViewRow row in driversGrid.Rows)
+            {
+                var match = row.Tag as X;
+                row.Visible = _showHiddenDevices == null || _showHiddenDevices.Checked || match == null || match.State != "没有匹配驱动";
+            }
+            if (!driversGrid.Columns.Contains("ChooseVersion") || _candByMatch == null) return;
+            foreach (DataGridViewRow row in driversGrid.Rows)
+            {
+                LanCandidateDto c; var x = row.Tag as X;
+                if (x != null && _candByMatch.TryGetValue(x, out c))
+                    row.Cells["ChooseVersion"].Value = c.DriverVerVersion ?? "";
+            }
+        }
+
+        private void ChooseDriverVersion(object sender, DataGridViewCellEventArgs e)
+        {
+            if (_lanScanning || _lanInstalling || e.RowIndex < 0 || e.ColumnIndex < 0 || driversGrid.Columns[e.ColumnIndex].Name != "ChooseVersion") return;
+            var x = driversGrid.Rows[e.RowIndex].Tag as X; LanCandidateDto current;
+            if (x == null || _candByMatch == null || !_candByMatch.TryGetValue(x, out current)) return;
+            if (!string.IsNullOrEmpty(current.PackageId)) { LanInfo("该设备使用专用机型整包，按整包统一安装。", "机型整包", MessageBoxIcon.Information); return; }
+            var options = current.Versions;
+            if (options == null || options.Count == 0) { LanInfo("服务端尚未提供适用版本列表，请先升级服务端并重新扫描。", "选择版本", MessageBoxIcon.Information); return; }
+            using (var dialog = new Form { Text = "选择驱动版本 · " + current.FriendlyName, Width = 740, Height = 470, StartPosition = FormStartPosition.CenterParent, MinimizeBox = false, MaximizeBox = false })
+            {
+                var tip = new Label { Dock = DockStyle.Top, Height = 68, Padding = new Padding(10), Text = "仅列出适用于当前硬件、操作系统和架构的仓库版本。默认优先稳定版。\r\n手动选择后仍校验哈希、签名和适用性；手动选版对当前设备安装指定驱动，允许较旧版本；只有确认实际绑定后才计为成功。" };
+                var list = new ListBox { Dock = DockStyle.Fill, HorizontalScrollbar = true };
+                foreach (var c in options) list.Items.Add(c.DriverVerVersion + " · " + c.DriverVerDate + " · " + c.ReleaseChannel.Trim() + " · " + c.Provider + " · " + c.InfRelativePath);
+                list.SelectedIndex = Math.Max(0, options.FindIndex(c => string.Equals(c.ContentHash, current.ContentHash, StringComparison.OrdinalIgnoreCase)));
+                var accept = new Button { Text = "使用所选版本", Dock = DockStyle.Right, Width = 145, DialogResult = DialogResult.OK };
+                var cancel = new Button { Text = "取消", Dock = DockStyle.Right, Width = 100, DialogResult = DialogResult.Cancel };
+                var bottom = new Panel { Dock = DockStyle.Bottom, Height = 45 }; bottom.Controls.Add(cancel); bottom.Controls.Add(accept);
+                dialog.Controls.Add(list); dialog.Controls.Add(tip); dialog.Controls.Add(bottom); dialog.AcceptButton = accept; dialog.CancelButton = cancel;
+                if (dialog.ShowDialog(this) != DialogResult.OK || list.SelectedIndex < 0) return;
+                UseDriverVersion(x, options, list.SelectedIndex);
+            }
+        }
+
+        private void UseDriverVersion(X x, List<LanCandidateDto> options, int index)
+        {
+            // Copy: cached report/other rows must never inherit a local user's consent.
+            var json = new JavaScriptSerializer();
+            var selected = json.Deserialize<LanCandidateDto>(json.Serialize(options[index]));
+            selected.Versions = options; selected.UserSelectedVersion = true;
+            selected.LocalRejectionReason = ""; selected.NeedInstall = true;
+            _candByMatch[x] = selected;
+            x.I = new I { Path = selected.InfRelativePath, Version = selected.DriverVerVersion, Class = selected.Class };
+            x.Pick = true; x.State = "手动选择版本";
+            FillDrivers();
+            footerStatus.Text = "已选择 " + selected.DriverVerVersion + "，点击安装所选后执行校验和安装。";
+        }
+
+        internal void TestVersionReport(LanReportResponse response, Machine m)
+        { scanResult = BuildLanScanResult(response, m); FillDrivers(); }
+        internal LanCandidateDto TestChooseVersion(int rowIndex, int versionIndex)
+        {
+            var x = (X)driversGrid.Rows[rowIndex].Tag; var options = _candByMatch[x].Versions;
+            UseDriverVersion(x, options, versionIndex); return _candByMatch[x];
         }
 
         private void ResetTransferColumns()
@@ -473,6 +638,12 @@ namespace UDA
         protected override void ApplyResponsiveRules()
         {
             base.ApplyResponsiveRules();
+            if (_showHiddenDevices != null && driverTools != null && driverSummaryPanel != null)
+            {
+                driverSummaryPanel.Width = Math.Max(ScalePx(150), Math.Min(ScalePx(520), driverTools.ClientSize.Width - ScalePx(350)));
+                var layout = driverTools.Parent as TableLayoutPanel;
+                if (layout != null) layout.RowStyles[0].Height = ScalePx(driverTools.ClientSize.Width < ScalePx(500) ? 132 : 92);
+            }
             if (_testBtn != null) _testBtn.Height = ScalePx(34);
             if (_serverLockBtn != null) { _serverLockBtn.Height = ScalePx(30); _serverLockBtn.Width = ScalePx(40); }
             if (_serverUrlBox != null) _serverUrlBox.Height = ScalePx(30);
@@ -501,8 +672,9 @@ namespace UDA
                 if (!string.IsNullOrEmpty(cand.DeviceInstanceId)) deviceById.TryGetValue(cand.DeviceInstanceId, out d);
                 // A historical receipt may only suppress a candidate when the device currently ACTUALLY
                 // runs that exact package. A missing/broken/unknown-version device must always surface.
-                if (LanDriverClient.IsReceiptSuppressed(cand, d)) continue;
-                if (!string.IsNullOrEmpty(cand.LocalRejectionReason)) continue;
+                bool hasVersions = string.IsNullOrEmpty(cand.PackageId) && cand.Versions != null && cand.Versions.Count > 1;
+                if (LanDriverClient.IsReceiptSuppressed(cand, d) && !hasVersions) continue;
+                if (!string.IsNullOrEmpty(cand.LocalRejectionReason) && !hasVersions) continue;
                 if (d == null)
                     d = new D { Name = string.IsNullOrWhiteSpace(cand.FriendlyName) ? (string.IsNullOrEmpty(cand.Class) ? "未知硬件" : cand.Class) : cand.FriendlyName,
                         Id = cand.DeviceInstanceId, Class = cand.Class, ClassGuid = cand.ClassGuid, Version = "", Inf = "" };
@@ -512,12 +684,14 @@ namespace UDA
                 // Update-type: a genuinely installed older driver.
                 bool installType = d.Bad || string.IsNullOrEmpty(d.Inf) || string.IsNullOrEmpty(d.Version);
                 string state = installType ? "安装驱动" : (newer ? "更新驱动" : "已是最新");
-                if (state == "已是最新") continue;
-                bool pick = true;
+                if (cand.IsExtension) state = cand.NeedInstall ? "安装配套扩展" : "已是最新";
+                if (state == "已是最新" && !hasVersions) continue;
+                bool pick = cand.NeedInstall && string.IsNullOrEmpty(cand.LocalRejectionReason);
+                if (!pick && hasVersions) state = "可选择版本";
                 // Exact hardware-ID match (level 4/3) takes precedence over compatible-ID matches;
                 // the server's MatchLevel is authoritative when present, Tier is the legacy fallback.
                 int matchLevel = cand.MatchLevel > 0 ? cand.MatchLevel : cand.Tier;
-                var x = new X { D = d, I = i, Cat = DriverCategoryMapper.Friendly(cand.Class),
+                var x = new X { D = d, I = i, Cat = cand.IsExtension ? "配套扩展" : DriverCategoryMapper.Friendly(cand.Class),
                     Type = (matchLevel >= 3 ? "精确硬件 ID" : "兼容 ID"), MatchTier = matchLevel, Reason = cand.MatchedId, State = state, Pick = pick };
                 r.Matches.Add(x);
                 _candByMatch[x] = cand;
@@ -600,9 +774,9 @@ namespace UDA
                         string reason = reportProbe != null && !string.IsNullOrWhiteSpace(reportProbe.Error) ? reportProbe.Error : "上报接口无响应";
                         _serverStatus.Text = "连接成功，但硬件上报不可用";
                         _serverMeta.Text = reason;
-                        sourceStatus.Text = "服务器：" + url + " · 上报预检失败";
+                        sourceStatus.Text = "已连接服务器 · 上报不可用";
                     }
-                    else sourceStatus.Text = "服务器：" + url + " · 连接及上报预检正常";
+                    else sourceStatus.Text = "已连接服务器";
                 }
                 logger.W("[INFO] " + _serverStatus.Text);
             }
@@ -619,7 +793,15 @@ namespace UDA
 
         private void UpdateServerStatus(LanHealth h)
         {
-            if (h == null) { _serverStatus.Text = "尚未连接服务器"; _serverMeta.Text = "-"; return; }
+            if (h == null) {
+                sourceStatus.Text = "未连接服务器"; _serverVersionText = "--"; _repositoryDateText = "--"; UpdateReleaseStatus();
+                _serverStatus.Text = "尚未连接服务器"; _serverMeta.Text = "-"; return;
+            }
+            sourceStatus.Text = "已连接服务器";
+            _serverVersionText = string.IsNullOrWhiteSpace(h.ServerVersion) ? "--" : h.ServerVersion;
+            DateTime updated;
+            _repositoryDateText = DateTime.TryParse(h.RepositoryUpdatedUtc, System.Globalization.CultureInfo.InvariantCulture, System.Globalization.DateTimeStyles.RoundtripKind, out updated) ? updated.ToLocalTime().ToString("yyyy-MM-dd HH:mm") : "--";
+            UpdateReleaseStatus();
             _serverStatus.Text = h.RepoLoaded
                 ? ("已连接 · 仓库已加载 · " + h.InfCount + " 个驱动 · 服务器版本 " + h.ServerVersion)
                 : "已连接，但服务器仓库尚未加载";
@@ -855,6 +1037,7 @@ namespace UDA
 
         protected override void Dispose(bool disposing)
         {
+            if (disposing && _clientDiagnostics != null) { _clientDiagnostics.Dispose(); _clientDiagnostics = null; }
             if (disposing && _lanCts != null) { try { _lanCts.Cancel(); } catch { } }
             base.Dispose(disposing);
         }
@@ -873,14 +1056,16 @@ namespace UDA
             _bootstrapBox.Text = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "NicBootstrap");
             _serverStatus.Text = "已连接 · 仓库已加载 · 1280 个驱动 · 服务器版本 3.0";
             _serverMeta.Text = "OS 过滤：amd64 v10 · 无需 Token（内网只读）";
-            sourceStatus.Text = "服务器：http://192.168.0.253:8731 · 已连接";
+            sourceStatus.Text = "已连接服务器";
             deploymentState.Text = "LAN 匹配";
+            UpdateServerStatus(new LanHealth { RepoLoaded = true, InfCount = 1280, ServerVersion = LanProtocol.ServerVersion, RepositoryUpdatedUtc = "2026-10-29T10:00:00Z" });
             driversGrid.Rows.Clear();
             for (int i = 0; i < 6; i++)
             {
                 driversGrid.Rows.Add(i < 3, i == 0 ? "缺少驱动" : (i < 3 ? "可更新" : "已是最新"),
                     "硬件设备 " + (i + 1), i % 2 == 0 ? "Net" : "Display", "1.0." + i, "2.0." + i,
                     i % 2 == 0 ? "精确硬件 ID" : "兼容 ID", "lan-driver-" + i + ".inf");
+                driversGrid.Rows[i].Cells["ChooseVersion"].Value = "2.0." + i;
             }
         }
 

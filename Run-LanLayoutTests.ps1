@@ -25,6 +25,7 @@ $sources=[string[]]@(
   (Join-Path $scriptRoot 'LanDriverService.cs'),
   (Join-Path $scriptRoot 'LanEditionForm.cs'),
   (Join-Path $scriptRoot 'WebAdmin.cs'),
+  (Join-Path $scriptRoot 'AiDriverTasks.cs'),
   (Join-Path $scriptRoot 'NicBootstrap.cs'),
   (Join-Path $scriptRoot 'Phase3Dispatch.cs'),
   (Join-Path $scriptRoot 'LayoutHarness.cs')

@@ -29,6 +29,7 @@ $sources=[string[]]@(
   (Join-Path $root 'LanDriverService.cs'),
   (Join-Path $root 'LanEditionForm.cs'),
   (Join-Path $root 'WebAdmin.cs'),
+  (Join-Path $root 'AiDriverTasks.cs'),
   (Join-Path $root 'NicBootstrap.cs'),
   (Join-Path $root 'Phase3Dispatch.cs'),
   (Join-Path $root 'LanGuiHarness.cs')

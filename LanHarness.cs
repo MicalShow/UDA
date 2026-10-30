@@ -1,4 +1,4 @@
-﻿// LanHarness.cs - Phase 3 LAN protocol end-to-end tests.
+// LanHarness.cs - Phase 3 LAN protocol end-to-end tests.
 //
 // Compiles alongside the real sources (Run-LanTests.ps1). Uses the real LanDriverServer (HttpListener)
 // on a loopback ephemeral port and the real LanDriverClient, with synthetic INFs, a trusting signature
@@ -42,6 +42,7 @@ namespace UDA
             Directory.CreateDirectory(root);
             // Never write fake installation receipts into the real machine's ProgramData.
             LanInstallReceiptStore.UseTestStore(Path.Combine(root, "test-receipts.txt"));
+            ClientTelemetryQueue.UseTestDirectory(Path.Combine(root, "test-telemetry"));
             LanPnpRejectionStore.UseTestStore(Path.Combine(root, "test-pnp-rejections.txt"));
             // Persistent service event log goes to a test-scoped directory so the resilience tests can
             // assert on it and never touch the real ProgramData log.
@@ -49,11 +50,29 @@ namespace UDA
             ServiceEventLog.InstallGlobalHandlers();
             using (_log = new L(Path.Combine(root, "logs")))
             {
+                Run("Lan.MissingNativeBinding", () => {
+                    var d = new D { Id = @"INTELAUDIO\FUNC_01&VEN_8086&DEV_2812&SUBSYS_80860101&REV_1000\1", Inf = "oem-stale.inf", Version = "99.0" };
+                    CurrentDriverState.ApplyProblemStatus(d, 28);
+                    T(d.Bad && d.Error == 28 && d.Inf == "" && d.Version == "", "Code 28 clears stale WMI binding and remains missing");
+                    CurrentDriverState.ApplyProblemStatus(d, 10);
+                    T(d.Bad && d.Error == 10, "other native problem codes remain visible");
+                    CurrentDriverState.ApplyProblemStatus(d, 0);
+                    T(!d.Bad && d.Inf == "", "healthy status does not fabricate a driver binding");
+                });
                 Run("Lan.Health", () => TestHealth(root));
+                Run("Lan.AiTasksAndInbox", () => TestAiTasksAndInbox(root));
+                Run("Lan.AiTaskControl", () => TestAiTaskControl(root));
+                Run("Lan.AiAutoSchedule", () => TestAiAutoSchedule(root));
+                Run("Lan.NewsSourcesAndInstallSessions", () => TestNewsSourcesAndInstallSessions(root));
+                Run("Lan.InstallLogPagingCache", () => TestInstallLogPagingCache(root));
+                Run("Lan.Resilience.StartupRecovery", () => TestStartupRecovery(root));
                 Run("Lan.ReportAndMatch", () => TestReportAndMatch(root));
+                Run("Lan.ClientVersionChoices", () => TestClientVersionChoices(root));
+                Run("Lan.ExtensionPackages", () => TestExtensionPackages(root));
                 Run("Lan.ModelPackageSharedDownload", () => TestModelPackageSharedDownload(root));
                 Run("Lan.ModelArchiveCompactPaths", () => TestModelArchiveCompactPaths(root));
                 Run("Lan.InstallEventTelemetryProtocol", () => TestInstallEventTelemetryProtocol(root));
+                Run("Lan.LiveClientDiagnostics", () => TestLiveClientDiagnostics(root));
                 Run("Lan.DownloadPackagePreGeneration", () => TestDownloadPackagePreGeneration(root));
                 Run("Lan.DownloadVerifyInstall", () => TestDownloadVerifyInstall(root));
                 Run("Lan.ClusterDirectDownloadRouting", () => TestClusterDirectDownloadRouting(root));
@@ -81,6 +100,12 @@ namespace UDA
                 Run("Lan.ScanSharedFileCache", () => TestScanSharedFileCache(root));
                 Run("Lan.ScanParallelGroupingAndCancel", () => TestScanParallelGroupingAndCancel(root));
                 Run("Lan.ReceiptNoMaskMissingDriver", () => TestReceiptNoMaskMissingDriver(root));
+                Run("Lan.IntelSgpcPlatformExtension", () => TestIntelSgpcPlatformExtension(root));
+                Run("Lan.ExcludedPnpDspCompatibility", () => TestExcludedPnpDspCompatibility(root));
+                Run("Lan.DependencyRetryAndFinalAudit", () => TestDependencyRetryAndFinalAudit(root));
+                Run("Lan.LegacyManufacturerGroups", () => TestLegacyManufacturerGroups(root));
+                Run("Lan.ActiveModelsAndMissingCompatibility", () => TestActiveModelsAndMissingCompatibility(root));
+                Run("Lan.SccmDelayedAudioEnumeration", () => TestSccmDelayedAudioEnumeration(root));
                 Run("Lan.ClosedLoopNewDeviceThenDone", () => TestClosedLoopNewDeviceThenDone(root));
                 Run("Lan.ClosedLoopDedupSameItem", () => TestClosedLoopDedupSameItem(root));
                 Run("Lan.ClosedLoopMaxRounds", () => TestClosedLoopMaxRounds(root));
@@ -104,6 +129,79 @@ namespace UDA
                 if (_failed > 0) { Console.WriteLine("RESULT: FAIL"); return 1; }
                 Console.WriteLine("RESULT: PASS");
                 return 0;
+            }
+        }
+
+        private sealed class ExtensionOrderRunner : IPnpInstallRunner
+        {
+            public D Device; public List<string> Calls = new List<string>();
+            public InstallResult AddInstall(string path, int seconds, L logger) { Calls.Add(Path.GetFileName(path)); if (Path.GetFileName(path) == "base.inf") { Device.Inf = "oem-base.inf"; Device.Version = "99.0.0.0"; Device.Error = 0; } return InstallPlanner.ResultFrom(0, false, "simulated"); }
+        }
+
+        private static void TestExtensionPackages(string root)
+        {
+            string dir = PrepareDir(Path.Combine(root, "extension-packages")), src = Path.Combine(dir, "source"); Directory.CreateDirectory(src);
+            string hw = @"ACPI\VEN_CSC&DEV_3551&SUBSYS_103C8971", lineage = "{A376638F-88E1-4142-AC8E-80F66727DC44}", second = "{128DD738-CBBD-47FC-AF8F-B06101732E25}";
+            string baseInf = WriteInf(src, "base.inf", @"ACPI\VEN_CSC&DEV_3551", "01/01/2026", "99.0.0.0", "NTamd64.10");
+            Func<string, string, string, string, string, string, string> extension = (name, id, extId, date, version, arch) => {
+                string path = WriteInf(src, name, id, date, version, arch);
+                File.WriteAllText(path, File.ReadAllText(path).Replace("Class=Net", "Class=Extension\nExtensionId=" + extId).Replace("{4d36e972-e325-11ce-bfc1-08002be10318}", "{e2f84ce7-8efa-411c-aa69-97454ca4cb57}"));
+                return path;
+            };
+            string applied = extension("amp-current.inf", hw, lineage, "02/01/2026", "1.0.0.0", "NTamd64.10");
+            extension("amp-old.inf", hw, lineage, "01/01/2025", "99.0.0.0", "NTamd64.10");
+            string other = extension("effect.inf", hw, second, "01/01/2026", "2.0.0.0", "NTamd64.10");
+            extension("other-oem.inf", @"ACPI\VEN_CSC&DEV_3551&SUBSYS_17AA1052", "{2B1479BE-8B54-4DDC-BE93-F8820395D415}", "01/01/2026", "3.0.0.0", "NTamd64.10");
+            extension("wrong-arch.inf", hw, "{921914AE-95E2-4F7F-879F-1FE10D422926}", "01/01/2026", "3.0.0.0", "NTarm64.10");
+            extension("broad-unknown-oem.inf", @"ACPI\CSC3551", "{39049374-50E4-4D54-ADE9-6248E8751A31}", "01/01/2026", "4.0.0.0", "NTamd64.10");
+            extension("missing-id.inf", hw, "", "01/01/2026", "3.0.0.0", "NTamd64.10");
+            var devices = new List<D> { Device(hw, "oem-parent.inf", "100.0.0.0", @"ACPI\CSC3551\1") }; devices[0].H.Add(@"ACPI\CSC3551");
+            string repo = MakeRepo(Path.Combine(dir, "repo"), src);
+            using (var env = StartEnv(repo, null, null))
+            {
+                CurrentDriverState.TestExtensionInfPaths = id => new List<string>();
+                try
+                {
+                    var runner = new FakePnpInstallRunner();
+                    var client = NewClient(env.Url, null, null, Path.Combine(dir, "cache"), devices, runner);
+                    var report = client.Report(devices, new Machine { Maker = "HP" }, CancellationToken.None, null);
+                    var companions = report.Candidates.Where(c => c.IsExtension).ToList();
+                    T(companions.Count == 2, "separate extension lineages are offered; other OEM/architecture and invalid ExtensionId excluded");
+                    T(companions.Any(c => c.DriverVerVersion == "1.0.0.0") && companions.All(c => c.DriverVerVersion != "99.0.0.0"), "same ExtensionId is ordered by driver date before version");
+                    T(companions.All(c => c.NeedInstall), "missing extension offered although healthy parent has much higher version");
+                    T(companions.All(c => LanInstallPolicy.Revalidate(c, devices[0], new OsTarget(), true) == null), "extension install policy does not compare extension version with parent");
+                    var installed = client.InstallCandidates(companions, devices, CancellationToken.None, null);
+                    T(installed.InstalledOk == 2 && runner.Calls.Count == 2 && runner.SelectedDeviceCalls.Count == 0, "generic installer downloads and installs both extension packages without force-binding parent");
+                    CurrentDriverState.TestExtensionInfPaths = id => new List<string> { applied, other };
+                    var repeated = client.Report(devices, new Machine { Maker = "HP" }, CancellationToken.None, null);
+                    T(repeated.Candidates.Where(c => c.IsExtension).All(c => !c.NeedInstall), "per-device applied extensions suppress repeat installation");
+                    CurrentDriverState.TestExtensionInfPaths = id => new List<string>();
+                    T(client.Report(devices, new Machine { Maker = "HP" }, CancellationToken.None, null).Candidates.Where(c => c.IsExtension).All(c => c.NeedInstall), "package files on disk do not suppress missing device association");
+                    var old = new LanReportRequest { RequestId = "old-extension-client", Devices = new List<LanDeviceDto> { new LanDeviceDto { DeviceInstanceId = devices[0].Id, HardwareIds = devices[0].H, CurrentInf = devices[0].Inf, CurrentVersion = devices[0].Version } } };
+                    var legacy = new JavaScriptSerializer().Deserialize<LanReportResponse>(HttpPost(env.Url + "/api/report", J(old), null).Item2);
+                    T(legacy.Candidates.All(c => !c.IsExtension), "legacy clients never receive independent extension candidates");
+                    var opened = OfflineRepo.Open(repo, _log);
+                    var legacyRecord = opened.Records.First(r => Path.GetFileName(r.Path) == "other-oem.inf");
+                    string archiveOnlyPath = LanSecurity.SafeAbsolute(repo, legacyRecord.Path), moved = Path.Combine(dir, "moved-extension.inf");
+                    File.Move(archiveOnlyPath, moved);
+                    try { T(LanExtensionPackages.RepositoryId(opened, legacyRecord) == "{2b1479be-8b54-4ddc-be93-f8820395d415}", "legacy index recovers ExtensionId from hash-verified archive without rebuilding catalog"); }
+                    finally { File.Move(moved, archiveOnlyPath); }
+                    runner.Calls.Clear();
+                    var closed = client.RunControlledLoop(null, CancellationToken.None, null, null, new LanDriverClient.LanClosedLoopOptions());
+                    T(closed.InstalledOk == 2 && runner.Calls.Count == 2, "closed loop completes missing extensions even on healthy newer base driver");
+                    var missing = new List<D> { Device(hw, "", "", devices[0].Id) };
+                    var order = new ExtensionOrderRunner { Device = missing[0] };
+                    var orderClient = new LanDriverClient(new LanClientConfig { ServerUrl = env.Url, StagingDir = Path.Combine(dir, "ordered-cache"), VerifySignature = true }, new Machine { Maker = "HP" }, new StaticHardwareCollector(missing), new OsTarget(), _log, new TrustingSignatureVerifier(), new AlwaysAdminChecker(), order, new NoOpSystemOps());
+                    var orderReport = orderClient.Report(missing, new Machine { Maker = "HP" }, CancellationToken.None, null);
+                    var ordered = orderClient.InstallCandidates(orderReport.Candidates.OrderByDescending(c => c.IsExtension).ToList(), missing, CancellationToken.None, null);
+                    T(ordered.InstalledOk == 3 && order.Calls.First() == "base.inf", "base installed before extensions even if caller supplies extensions first");
+                    string saved = companions[0].ExtensionId; companions[0].ExtensionId = Guid.NewGuid().ToString("B");
+                    runner.Calls.Clear(); var rejected = client.InstallCandidates(new List<LanCandidateDto> { companions[0] }, devices, CancellationToken.None, null);
+                    T(rejected.InstalledOk == 0 && runner.Calls.Count == 0, "actual extracted ExtensionId must equal recommendation"); companions[0].ExtensionId = saved;
+                    var os = new OsTarget { Architecture = "amd64", MajorVersion = 6, MinorVersion = 1, BuildNumber = 7601 };
+                    T(LanInstallPolicy.Revalidate(companions[0], devices[0], os, true) != null, "extension path cannot bypass Windows version applicability");
+                }
+                finally { CurrentDriverState.TestExtensionInfPaths = null; }
             }
         }
 
@@ -308,6 +406,127 @@ namespace UDA
         // ---------------------------------------------------------------------------
         //  2. Report + match (server returns the right candidate for the device).
         // ---------------------------------------------------------------------------
+        private static void TestInstallLogPagingCache(string root)
+        {
+            string dir = PrepareDir(Path.Combine(root, "log-page-cache"));
+            var source = new List<DriverInstallEvent>();
+            for (int i = 0; i < 1200; i++)
+            {
+                var e = new DriverInstallEvent { EventId = Guid.NewGuid().ToString("N"), RunId = i.ToString("x32"), Machine = "BENCH-" + (i % 20), MachineId = (i % 20 + 1).ToString("x64"), Status = "log", Utc = DateTime.UtcNow.AddMinutes(-i).ToString("o"), Detail = new string('x', 8192) + " ORIGINAL-END" };
+                source.Add(e); ServerStorage.Write(dir, "install-events/" + e.EventId + ".json", J(e), true);
+            }
+            var index = new InstallLogPages(dir); var cold = System.Diagnostics.Stopwatch.StartNew();
+            var snapshot = index.Read(false); snapshot.Page("", "", DateTimeOffset.MinValue, DateTimeOffset.MaxValue, false, 1, 20); cold.Stop();
+            var warm = System.Diagnostics.Stopwatch.StartNew();
+            for (int page = 1; page <= 60; page++) index.Read(false).Page("", "", DateTimeOffset.MinValue, DateTimeOffset.MaxValue, false, page, 20);
+            warm.Stop();
+            T(index.FullReads == 1 && index.Builds == 1, "sixty page requests never reread all event bodies or rebuild identity/statistics");
+            T(snapshot.Sessions.Count == 1200 && snapshot.Sessions.All(s => s.Rows.All(e => e.Detail.Length < 600)), "all sessions remain indexed with bounded metadata previews");
+            var body = J(snapshot.Details(dir, source[0].RunId, "", 0, 100));
+            T(body.Contains("ORIGINAL-END"), "full original body is fetched on demand even for a single-fragment session");
+            var changed = new DriverInstallEvent { EventId = Guid.NewGuid().ToString("N"), RunId = Guid.NewGuid().ToString("N"), Machine = "NEW-PC", MachineId = new string('f', 64), Status = "installed", Utc = DateTime.UtcNow.ToString("o"), Device = "DEVICE-NEW" };
+            string key = "install-events/" + changed.EventId + ".json";
+            ServerStorage.Write(dir, key, J(changed), true); var added = index.Read(false);
+            T(added.Sessions.Count == 1201 && added.Hardware == 1 && index.FullReads == 1, "new log incrementally updates sessions and usage without full storage reload");
+            changed.Status = "failed"; ServerStorage.Write(dir, key, J(changed), true);
+            T(index.Read(false).Hardware == 1, "immutable duplicate cannot overwrite cached success");
+            ServerStorage.Delete(dir, key);
+            T(index.Read(false).Sessions.Count == 1200 && index.Read(false).Hardware == 0 && index.FullReads == 1, "deletion invalidates cached page/statistics without full reload");
+            index.Read(true); T(index.FullReads == 2, "explicit refresh can reconcile externally edited storage");
+            Console.WriteLine("[INFO] Log pagination benchmark: 1200 sessions / 9.4MiB raw detail; cold=" + cold.ElapsedMilliseconds + "ms; 60 warm pages=" + warm.ElapsedMilliseconds + "ms; body scans during warm pagination=0");
+        }
+
+        private static void TestClientVersionChoices(string root)
+        {
+            string audioDir = PrepareDir(Path.Combine(root, "hp-audio-specificity"));
+            string audioSrc = Path.Combine(audioDir, "source"); Directory.CreateDirectory(audioSrc);
+            string codec = "INTELAUDIO\\FUNC_01&VEN_10EC&DEV_0245", hpCodec = codec + "&SUBSYS_103C8971";
+            foreach (var spec in new[] { new[] { "generic.inf", codec, "9.0.0.0" }, new[] { "hp-old.inf", hpCodec, "1.0.0.0" }, new[] { "hp-new.inf", hpCodec, "2.0.0.0" }, new[] { "other-oem.inf", codec + "&SUBSYS_10281234", "99.0.0.0" } })
+            {
+                string inf = WriteInf(audioSrc, spec[0], spec[1], "01/01/2026", spec[2], "NTamd64.10");
+                File.WriteAllText(inf, File.ReadAllText(inf).Replace("Class=Net", "Class=MEDIA").Replace("{4d36e972-e325-11ce-bfc1-08002be10318}", "{4d36e96c-e325-11ce-bfc1-08002be10318}"));
+            }
+            string audioRepo = MakeRepo(Path.Combine(audioDir, "repo"), audioSrc);
+            var audioManifest = OfflineRepoGenerator.TryLoadManifest(audioRepo);
+            var genericPolicy = DriverReleasePolicies.Scope("windows11", "amd64", codec, "MEDIA");
+            genericPolicy.StableHash = audioManifest.Entries.First(e => e.DriverVerVersion == "9.0.0.0").ContentHash;
+            DriverReleasePolicies.Save(audioRepo, genericPolicy);
+            string brandCredentials = Path.Combine(audioDir, "brand-admin.json"); AdminCredentialStore.Create(brandCredentials, "brand-admin", "Brand-Admin-Password-123!");
+            using (var env = StartEnv(audioRepo, null, null, null, brandCredentials))
+            {
+                var report = new LanReportRequest { RequestId = "hp-audio", OsArchitecture = "amd64", OsMajorVersion = 10, OsBuildNumber = 26300, Devices = new List<LanDeviceDto> { new LanDeviceDto { DeviceInstanceId = "HP-CODEC", Class = "MEDIA", HardwareIds = new List<string> { hpCodec + "&REV_1000", hpCodec, codec } } } };
+                Func<LanCandidateDto> selected = () => new JavaScriptSerializer().Deserialize<LanReportResponse>(HttpPost(env.Url + "/api/report", J(report), null).Item2).Candidates.Single();
+                var candidate = selected();
+                T(candidate.DriverVerVersion == "2.0.0.0" && candidate.MatchedInfId == hpCodec, "HP subsystem match outranks newer generic codec even when generic is configured stable");
+                T(candidate.Versions.All(v => v.DriverVerVersion != "99.0.0.0"), "another OEM subsystem codec is never offered for HP audio");
+                var hpPolicy = DriverReleasePolicies.Scope("windows11", "amd64", hpCodec, "MEDIA"); hpPolicy.StableHash = audioManifest.Entries.First(e => e.DriverVerVersion == "1.0.0.0").ContentHash;
+                DriverReleasePolicies.Save(audioRepo, hpPolicy);
+                T(selected().DriverVerVersion == "1.0.0.0", "configured stable version still wins within identical OEM hardware match quality");
+                var cookies = new CookieContainer();
+                string oldId = audioManifest.Entries.First(e => e.DriverVerVersion == "1.0.0.0").RelativePath;
+                string newId = audioManifest.Entries.First(e => e.DriverVerVersion == "2.0.0.0").RelativePath;
+                T(HttpAdmin(env.Url + "/api/admin/driver-oem-brand", "POST", J(new { id = oldId, brand = "HP" }), cookies).Item1 == 401, "driver brand editing requires administrator login");
+                T(HttpAdmin(env.Url + "/api/admin/login", "POST", J(new { user = "brand-admin", password = "Brand-Admin-Password-123!" }), cookies).Item1 == 200, "brand administrator logs in");
+                T(HttpAdmin(env.Url + "/api/admin/driver-oem-brand", "POST", J(new { id = oldId, brand = "HP" }), cookies).Item1 == 200 && HttpAdmin(env.Url + "/api/admin/driver-oem-brand", "POST", J(new { id = newId, brand = "Lenovo" }), cookies).Item1 == 200, "driver OEM annotations are saved through protected API");
+                hpPolicy.StableHash = audioManifest.Entries.First(e => e.DriverVerVersion == "2.0.0.0").ContentHash; DriverReleasePolicies.Save(audioRepo, hpPolicy);
+                report.MachineManufacturer = "Hewlett-Packard";
+                T(selected().DriverVerVersion == "1.0.0.0" && selected().OemBrand == "HP", "same-brand HP candidate wins over newer Lenovo candidate configured stable at equal hardware specificity");
+                T(HttpAdmin(env.Url + "/api/admin/driver-oem-brand", "POST", J(new { id = oldId, brand = "" }), cookies).Item1 == 200 && selected().DriverVerVersion == "1.0.0.0", "unknown OEM fallback wins over known other-brand driver");
+                report.MachineManufacturer = "";
+                T(selected().DriverVerVersion == "2.0.0.0", "legacy client without OEM retains normal version policy");
+                T(DriverOemBrands.Normalize("HP Inc.") == "HP" && DriverOemBrands.Normalize("LENOVO") == "Lenovo" && DriverOemBrands.Normalize("Realtek Semiconductor Corp.") == "" && DriverOemBrands.Normalize("chipset") == "", "brand aliases normalize without treating chipset vendors or substring hp as OEM provenance");
+                T(DriverOemBrands.Resolve(new Dictionary<string, string>(), "", "Lenovo_T14", "packages/generic.inf", "Realtek", "Realtek") == "Lenovo", "explicit source OEM is recognized independently from chipset publisher");
+            }
+            string dir = PrepareDir(Path.Combine(root, "version-choices"));
+            string src = Path.Combine(dir, "src"); Directory.CreateDirectory(src);
+            string id = "PCI\\VEN_CAFE&DEV_5320";
+            WriteInf(src, "stable.inf", id, "01/01/2025", "1.0.0.0", "NTamd64.10");
+            WriteInf(src, "latest.inf", id, "01/01/2026", "2.0.0.0", "NTamd64.10");
+            WriteInf(src, "future.inf", id, "01/01/2026", "3.0.0.0", "NTamd64.10.0...22000");
+            WriteInf(src, "other.inf", "PCI\\VEN_CAFE&DEV_OTHER", "01/01/2026", "9.0.0.0", "NTamd64.10");
+            string rootRepo = MakeRepo(Path.Combine(dir, "repo"), src);
+            using (var repo = OfflineRepo.Open(rootRepo, _log))
+            {
+                var p = DriverReleasePolicies.Scope("windows10", "amd64", id, "Net");
+                p.StableHash = repo.Manifest.Entries.First(e => e.DriverVerVersion == "1.0.0.0").ContentHash;
+                p.LatestHash = repo.Manifest.Entries.First(e => e.DriverVerVersion == "2.0.0.0").ContentHash;
+                DriverReleasePolicies.Save(rootRepo, p);
+            }
+            using (var env = StartEnv(rootRepo, null, null))
+            {
+                var request = new LanReportRequest { RequestId = "version-choices", OsArchitecture = "amd64", OsMajorVersion = 10, OsBuildNumber = 19045,
+                    Devices = new List<LanDeviceDto> { new LanDeviceDto { DeviceInstanceId = "CHOICES", HardwareIds = new List<string> { id } } } };
+                var response = new JavaScriptSerializer().Deserialize<LanReportResponse>(HttpPost(env.Url + "/api/report", J(request), null).Item2);
+                var c = response.Candidates.Single();
+                T(c.DriverVerVersion == "1.0.0.0" && c.ReleaseChannel.Contains("稳定版"), "client default is configured stable version");
+                T(c.Versions.Count == 2 && c.Versions.Any(v => v.DriverVerVersion == "2.0.0.0" && v.ReleaseChannel.Contains("最新版")), "report includes other compatible versions and channel labels");
+                T(c.Versions.All(v => v.Versions.Count == 0 && v.DriverVerVersion != "3.0.0.0" && v.DriverVerVersion != "9.0.0.0"), "version list is flat and excludes unsupported OS and other hardware");
+                var device = new D { Id = "CHOICES", Inf = "oem.inf", Version = "2.0.0.0", H = new List<string> { id } };
+                T(LanInstallPolicy.Revalidate(c, device, new OsTarget { Architecture = "amd64", MajorVersion = 10, BuildNumber = 19045 }, true) != null, "automatic path still refuses silent downgrade");
+                c.UserSelectedVersion = true;
+                T(LanInstallPolicy.Revalidate(c, device, new OsTarget { Architecture = "amd64", MajorVersion = 10, BuildNumber = 19045 }, true) == null, "explicit local version choice reaches normal Windows installation checks");
+                T(!new JavaScriptSerializer().Deserialize<LanCandidateDto>(J(c)).UserSelectedVersion, "server cannot serialize local consent to override version selection");
+                c.SignatureStatus = "untrusted";
+                T(LanInstallPolicy.Revalidate(c, device, new OsTarget { Architecture = "amd64", MajorVersion = 10, BuildNumber = 19045 }, true) != null, "explicit choice never bypasses signature checks");
+                c.SignatureStatus = "trusted";
+                var second = new JavaScriptSerializer().Deserialize<LanCandidateDto>(J(c)); second.DeviceInstanceId = "CHOICES-SECOND"; second.UserSelectedVersion = true;
+                var secondDevice = new D { Id = second.DeviceInstanceId, Inf = "oem.inf", Version = "2.0.0.0", H = new List<string> { id } };
+                var explicitRunner = new FakePnpInstallRunner();
+                var explicitClient = NewClient(env.Url, "", "", Path.Combine(dir, "manual-staging"), new List<D> { device, secondDevice }, explicitRunner);
+                var installed = explicitClient.InstallCandidates(new List<LanCandidateDto> { c, second }, new List<D> { device, secondDevice }, CancellationToken.None, null);
+                T(installed.InstalledOk == 2 && explicitRunner.SelectedDeviceCalls.SequenceEqual(new[] { "CHOICES", "CHOICES-SECOND" }), "manual older version uses device-scoped installation for both instances rather than pnputil ranking or hash-only coalescing");
+                var laterPolicy = DriverReleasePolicies.Scope("windows10", "amd64", id, "Net"); laterPolicy.StableHash = c.Versions.First(v => v.DriverVerVersion == "2.0.0.0").ContentHash; DriverReleasePolicies.Save(rootRepo, laterPolicy);
+                device.Version = "0.5.0.0"; var loopRunner = new FakePnpInstallRunner();
+                var loopClient = NewClient(env.Url, "", "", Path.Combine(dir, "manual-loop"), new List<D> { device }, loopRunner);
+                var loop = loopClient.RunControlledLoop(new List<LanCandidateDto> { c }, CancellationToken.None, null, null, new LanDriverClient.LanClosedLoopOptions { AllowUpdates = true });
+                T(loopRunner.Calls.Count == 1 && loopRunner.SelectedDeviceCalls.Count == 1 && loop.NoCandidatesRemaining, "automatic continuation never replaces a user-selected version on the same device even when updates are authorized");
+            }
+            string largeRoot = Path.Combine(dir, "large-policies");
+            var bulk = Enumerable.Range(0, 7000).Select(i => new DriverReleasePolicy { HardwareId = "PCI\\VEN_ABCD&DEV_" + i, DriverClass = "Net", StableHash = new string('a', 64), LatestHash = new string('b', 64), StableReason = new string('x', 180) }).ToList();
+            DriverReleasePolicies.SaveMany(largeRoot, bulk);
+            T(new FileInfo(Path.Combine(largeRoot, "repo.release-policies.json")).Length > 2 * 1024 * 1024 && DriverReleasePolicies.Load(largeRoot).Count == bulk.Count, "large warehouse policy set persists beyond default serializer limit");
+        }
+
         private static void TestReportAndMatch(string root)
         {
             string dir = PrepareDir(Path.Combine(root, "report"));
@@ -355,6 +574,59 @@ namespace UDA
 
         // Current protocol 2 is accepted, and protocol 1 remains accepted only for authenticated
         // install telemetry to drain queues created by v5.2.0 clients.
+        private sealed class HeldInstaller : IPnpInstallRunner
+        {
+            public readonly ManualResetEvent Started = new ManualResetEvent(false), Release = new ManualResetEvent(false);
+            public InstallResult AddInstall(string path, int timeout, L logger) {
+                logger.W("[INFO] installer-still-running"); Started.Set();
+                if (!Release.WaitOne(15000)) throw new TimeoutException("test installer release");
+                return InstallPlanner.ResultFrom(0, false, "fake install");
+            }
+        }
+        private static bool AwaitDiagnostic(Func<bool> condition) {
+            for (int i = 0; i < 200; i++) { if (condition()) return true; Thread.Sleep(50); } return false;
+        }
+        private static void TestLiveClientDiagnostics(string root)
+        {
+            string dir = PrepareDir(Path.Combine(root, "live-client-diagnostics")), src = Path.Combine(dir, "src"); Directory.CreateDirectory(src);
+            string hw = @"PCI\VEN_8086&DEV_A0C8"; WriteInf(src, "live.inf", hw, "01/01/2026", "1.0.0.0", "NTamd64.10");
+            string repo = MakeRepo(Path.Combine(dir, "repo"), src);
+            using (var env = StartEnv(repo, null, null)) using (var logger = new L(Path.Combine(dir, "client-logs"))) {
+                var device = Dev(hw, "live-device", "", "", true); var runner = new HeldInstaller();
+                var client = new LanDriverClient(new LanClientConfig { ServerUrl = env.Url, StagingDir = Path.Combine(dir, "cache"), VerifySignature = true }, null, new StaticHardwareCollector(new[] { device }), new OsTarget(), logger, new TrustingSignatureVerifier(), new AlwaysAdminChecker(), runner, new NoOpSystemOps());
+                string run = Guid.NewGuid().ToString("N"), eventDir = Path.Combine(repo, "install-events");
+                Func<List<DriverInstallEvent>> received = () => Directory.Exists(eventDir) ? Directory.GetFiles(eventDir, "*.json").Select(f => { try { return new JavaScriptSerializer().Deserialize<DriverInstallEvent>(File.ReadAllText(f)); } catch { return null; } }).Where(e => e != null && e.RunId == run).ToList() : new List<DriverInstallEvent>();
+                using (client.StartLiveDiagnostics("SCCM-test", true, run)) {
+                    logger.W("[INFO] before-install marker apiKey=superSecret --token anotherSecret");
+                    T(AwaitDiagnostic(() => received().Any(e => (e.Detail ?? "").Contains("before-install marker"))), "startup/scan logs reach server before any install finishes");
+                    T(received().All(e => (e.Status == "log" || e.Status == "running") && !e.CountInUsage) && !received().Any(e => (e.Detail ?? "").Contains("superSecret") || (e.Detail ?? "").Contains("anotherSecret")), "diagnostics exclude credentials and do not inflate usage/install counts");
+                    var report = client.Report(new[] { device }, new Machine { Maker = "TestVendor" }, CancellationToken.None, null);
+                    var installing = System.Threading.Tasks.Task.Run(() => client.InstallCandidates(report.Candidates, new List<D> { device }, CancellationToken.None, null));
+                    try {
+                        T(runner.Started.WaitOne(5000), "test installer is deliberately held open");
+                        T(AwaitDiagnostic(() => received().Any(e => (e.Detail ?? "").Contains("installer-still-running"))) && !installing.IsCompleted, "long installation logs stream while installer is still running");
+                    } finally { runner.Release.Set(); installing.Wait(); }
+                    T(client.DiagnosticRunId == run, "SCCM startup, scan and install share supplied run ID");
+                    var blocked = new ManualResetEvent(false); var release = new ManualResetEvent(false);
+                    client.TestTelemetryTransport = entry => { blocked.Set(); release.WaitOne(10000); return false; };
+                    logger.W("[INFO] offline-live-marker " + new string('x', 9000));
+                    try {
+                        T(blocked.WaitOne(6000), "background transport is blocked to simulate outage");
+                        var writing = System.Threading.Tasks.Task.Run(() => logger.W("[INFO] concurrent-persist " + new string('y', 9000)));
+                        T(writing.Wait(1000), "network outage cannot hold the local persistence lock or block installation logger");
+                    } finally { release.Set(); client.TestTelemetryTransport = null; }
+                    T(AwaitDiagnostic(() => received().Any(e => (e.Detail ?? "").Contains("offline-live-marker"))), "outage logs persist and replay without reinstalling drivers");
+                }
+                T(AwaitDiagnostic(() => received().Any(e => e.Device == "live-device" && e.Status != "log")), "per-device installation result remains available alongside streamed logs");
+                T(O.Parse(new[] { "--sccm", "--session-id", run, "--sccm-result", "result.json" }).SessionId == run, "two-stage SCCM accepts a persistent cross-boot session ID");
+                var phase = new DriverInstallEvent { EventId = "phase", Device = "__UDA_SESSION__", Status = "unverified", Utc = "2026-10-30T00:00:02Z", CountInUsage = false };
+                var installed = new DriverInstallEvent { EventId = "device", Device = "DSP", Status = "installed", Utc = "2026-10-30T00:00:01Z" };
+                T(InstallLogIdentity.Summarize(new[] { installed, phase }, "test").Status == "unverified", "successful base driver cannot hide incomplete deployment status");
+                phase.Status = "completed";
+                T(InstallLogIdentity.Summarize(new[] { installed, phase }, "test").Status == "installed", "post-reboot final verification resolves the same session status");
+            }
+        }
+
         private static void TestInstallEventTelemetryProtocol(string root)
         {
             string dir = PrepareDir(Path.Combine(root, "install-event-telemetry"));
@@ -1612,6 +1884,219 @@ namespace UDA
         }
 
         // Install round 0 for device A; round 1 finds new device B missing and installs it; round 2 has none -> done.
+        private static void TestIntelSgpcPlatformExtension(string root)
+        {
+            string dir = PrepareDir(Path.Combine(root, "intel-sgpc")), src = Path.Combine(dir, "src"); Directory.CreateDirectory(src);
+            string parentId = @"PCI\VEN_8086&DEV_A0C8", legacyId = @"INTELAUDIO\FUNC_01&VEN_8086&DEV_2812", sgpcId = @"INTELAUDIO\SGPC_FUNC_01&VEN_8086&DEV_2812";
+            string path = WriteInf(src, "HdBusExt.inf", parentId, "04/02/2024", "31.0.101.5388", "NTamd64.10");
+            string text = File.ReadAllText(path).Replace("Class=Net", "Class=Extension\nExtensionId={69CB4EDD-BAFE-4F9A-9135-C1F284D6860D}").Replace("{4d36e972-e325-11ce-bfc1-08002be10318}", "{e2f84ce7-8efa-411c-aa69-97454ca4cb57}");
+            text = System.Text.RegularExpressions.Regex.Replace(text, @"(?m)^Provider=.*$", "Provider=Intel Corporation");
+            File.WriteAllText(path, text);
+            WriteInf(src, "mshdadac.inf", sgpcId, "04/02/2024", "31.0.101.5388", "NTamd64.10");
+            var record = InfParser.Parse(path, "unknown");
+            var id = new Guid("69CB4EDD-BAFE-4F9A-9135-C1F284D6860D");
+            T(LanExtensionPackages.IsIntelSgpcPlatformExtension(record, id), "verified Intel platform lineage accepts intentional PCI VEN/DEV targeting");
+            T(!LanExtensionPackages.IsIntelSgpcPlatformExtension(record, Guid.NewGuid()), "unknown lineage cannot bypass OEM targeting policy");
+            record.HardwareIds.Add(@"ACPI\CSC3551");
+            T(!LanExtensionPackages.IsIntelSgpcPlatformExtension(record, id), "speaker amplifier cannot use platform exception");
+            string repo = MakeRepoFromDirs(Path.Combine(dir, "repo"), new List<string> { src });
+            using (var env = StartEnv(repo, null, null))
+            {
+                var parent = Dev(parentId, "sgpc-parent", "oem-sst.inf", "10.29.0.12571", false);
+                parent.H = new List<string> { parentId + "&SUBSYS_50AA17AA&REV_20", parentId + "&SUBSYS_50AA17AA" };
+                parent.K = new List<string> { parentId + "&REV_20", parentId, @"PCI\CC_040100" };
+                var verdict = InfApplicability.Evaluate(InfParser.Parse(path, "unknown"), new OsTarget { Architecture = "amd64", MajorVersion = 10, BuildNumber = 26300 }, parent.H, parent.K);
+                T(verdict.MatchLevel == InfMatchLevel.CompatibleIdVsHardwareId, "real PCI VEN/DEV targets match compatible IDs rather than subsystem hardware IDs");
+                T(!LanExtensionPackages.MatchesExtensionTarget(InfParser.Parse(path, "unknown"), Guid.NewGuid(), verdict), "unknown extension lineage cannot use PCI compatible-ID exception");
+                var client = LoopClient(env.Url, Path.Combine(dir, "cache"), new StaticHardwareCollector(new[] { parent }), new FakePnpInstallRunner());
+                try
+                {
+                    CurrentDriverState.TestExtensionInfPaths = device => new List<string>();
+                    var response = client.Report(new[] { parent, Dev(legacyId, "sgpc-legacy-child", "", "", true) }, new Machine { Maker = "Lenovo", Model = "K14 Gen 1" }, CancellationToken.None, null);
+                    T(response.Candidates.Any(c => c.IsExtension && c.InfRelativePath.EndsWith("HdBusExt.inf")), "generic Intel controller extension is offered on Lenovo without OEM provenance");
+                    T(!response.Candidates.Any(c => c.DeviceInstanceId == "sgpc-legacy-child" && !c.IsExtension), "SGPC-only audio package is not forced onto legacy FUNC child");
+                    var installed = client.InstallCandidates(response.Candidates.Where(c => c.IsExtension).ToList(), new List<D> { parent }, CancellationToken.None, null);
+                    T(installed.InstalledOk == 1, "client extraction and final revalidation also accept realistic PCI compatible-ID controller extension");
+                    CurrentDriverState.TestExtensionInfPaths = device => device == parent.Id ? new List<string> { path } : new List<string>();
+                    response = client.Report(new[] { parent, Dev(sgpcId, "sgpc-new-child", "", "", true) }, new Machine { Maker = "Lenovo", Model = "K14 Gen 1" }, CancellationToken.None, null);
+                    T(response.Candidates.Any(c => !c.IsExtension && c.DeviceInstanceId == "sgpc-new-child"), "subsequent SGPC child matches audio function driver");
+                }
+                finally { CurrentDriverState.TestExtensionInfPaths = null; }
+            }
+        }
+
+        private static void TestLegacyManufacturerGroups(string root)
+        {
+            string dir = PrepareDir(Path.Combine(root, "legacy-model-groups")), src = Path.Combine(dir, "src"); Directory.CreateDirectory(src);
+            string hw = @"ACPI\LEGACYGROUP1", path = Path.Combine(src, "groups.inf");
+            File.WriteAllText(path, "[Version]\nSignature=\"$Windows NT$\"\nClass=System\nDriverVer=01/01/2026,1.0.0.0\n[Manufacturer]\nA=First,NTamd64.10.0...19041\nB=Second,NTamd64.10.0...22000\n[First.NTamd64.10.0...19041]\nDevice=Install," + hw + "\n[Second.NTamd64.10.0...22000]\nOther=Install,ACPI\\OTHERGROUP\n");
+            string repoDir = MakeRepoFromDirs(Path.Combine(dir, "repo"), new List<string> { src });
+            var repo = OfflineRepo.Open(repoDir, _log); var record = repo.Records.First();
+            record.ModelSections.Clear(); foreach (var m in record.Models) m.ModelGroup = "";
+            var target = new OsTarget { Architecture = "amd64", MajorVersion = 10, BuildNumber = 26300 };
+            T(!InfApplicability.Evaluate(record, target, new[] { hw }, null).Applicable, "legacy missing manufacturer groups reproduce false exclusion");
+            OfflineRepoGenerator.PrepareDownloadPackages(repoDir, null, 1);
+            File.Delete(LanSecurity.SafeAbsolute(repoDir, record.Path));
+            var completed = LanExtensionPackages.CompleteRepositoryModels(repo, record);
+            T(InfApplicability.Evaluate(completed, target, new[] { hw }, null).Applicable, "matched archive restores each manufacturer model group without full repository reconstruction");
+            T(completed.ModelSections.Count == 2 && completed.ContentHash == record.ContentHash, "recovered metadata is pinned to exact repository INF bytes");
+        }
+
+        private static void TestDependencyRetryAndFinalAudit(string root)
+        {
+            var identifiers = new D { H = new List<string> { "stale" }, K = new List<string> { "fallback" } };
+            CurrentDriverState.ApplyDeviceIdentifiers(identifiers, new List<string> { @"PCI\VEN_8086&DEV_A0C8&SUBSYS_50AA17AA", @"PCI\VEN_8086&DEV_A0C8" }, new List<string> { @"PCI\CC_040100", @"PCI\CC_0401" });
+            T(identifiers.H.Count == 2 && identifiers.K.Count == 2 && !identifiers.H.Contains("stale"), "native acquisition retains every hardware/compatible ID and replaces stale WMI IDs");
+            CurrentDriverState.ApplyDeviceIdentifiers(identifiers, null, null);
+            T(identifiers.H.Count == 2 && identifiers.K.Count == 2, "failed native read retains inventory fallback");
+            string first = LanDriverClient.DeviceInventoryFingerprint(new[] { identifiers }); identifiers.K.Add(@"PCI\CC_04");
+            T(first != LanDriverClient.DeviceInventoryFingerprint(new[] { identifiers }), "changed compatible IDs reset quiet-state detection");
+            var interactive = Phase3Dispatch.InteractiveLoopOptions();
+            T(interactive.QuietPasses >= 4 && interactive.MaxRounds >= 20 && interactive.RescanBeforeCollection && !interactive.AllowUpdates, "interactive install waits for dependent children without authorizing unrelated updates");
+            var inventory = new List<D> { new D { Id = "existing" } };
+            CurrentDriverState.MergePresentDevices(inventory, new[] { "EXISTING", @"INTELAUDIO\DSP_CTLR_DEV_A0C8", @"INTELAUDIO\DSP_CTLR_DEV_A0C8", "" });
+            T(inventory.Count == 2 && inventory[1].Id.Contains("DSP_CTLR"), "native present-device inventory supplies WMI omissions without duplicate instances");
+            string dir = PrepareDir(Path.Combine(root, "dependency-retry")), src = Path.Combine(dir, "src"); Directory.CreateDirectory(src);
+            string childId = @"INTELAUDIO\DSP_CTLR_DEV_A0C8&VEN_8086&DEV_0222", busId = @"PCI\VEN_8086&DEV_A0C8";
+            WriteInf(src, "intcoed.inf", childId, "01/01/2026", "1.0.0.0", "NTamd64.10");
+            WriteInf(src, "IntcAudioBus.inf", busId, "01/01/2026", "1.0.0.0", "NTamd64.10");
+            string repo = MakeRepoFromDirs(Path.Combine(dir, "repo"), new List<string> { src });
+            Func<string, string, bool, D> device = (hw, id, healthy) => { var d = Dev(hw, id, healthy ? "oem-bound.inf" : "", healthy ? "1.0.0.0" : "", !healthy); if (!healthy) d.Error = 28; return d; };
+            using (var env = StartEnv(repo, null, null))
+            {
+                var runner = new FakePnpInstallRunner(); runner.ExitCodes.Enqueue(13); runner.ExitCodes.Enqueue(0); runner.ExitCodes.Enqueue(0);
+                var collector = new MutatingCollector(new List<List<D>> {
+                    new List<D> { device(childId, "dependent-child", false), device(busId, "parent-bus", false) },
+                    new List<D> { device(childId, "dependent-child", false), device(busId, "parent-bus", true) },
+                    new List<D> { device(childId, "dependent-child", true), device(busId, "parent-bus", true) }
+                }, null);
+                var client = LoopClient(env.Url, Path.Combine(dir, "cache"), collector, runner);
+                var loop = client.RunControlledLoop(null, CancellationToken.None, null, null, new LanDriverClient.LanClosedLoopOptions { AllowUpdates = true });
+                T(runner.Calls.Count == 3 && loop.Log.Any(line => line.Contains("Retry after PnP dependency change")), "failed child retries after bus binding changes rather than permanent per-session suppression");
+                T(loop.InstalledFail == 1 && loop.CompletionAudited && loop.FinalProblems.Count == 0 && Phase3Dispatch.SccmExitCode(loop) == 0, "historical failed attempt is retained but verified recovered deployment succeeds");
+                var sameInventory = new List<List<D>> {
+                    new List<D> { device(childId, "present-from-start", false) },
+                    new List<D> { device(childId, "present-from-start", false) },
+                    new List<D> { device(childId, "present-from-start", true) }
+                };
+                var retryRunner = new FakePnpInstallRunner(); retryRunner.ExitCodes.Enqueue(13); retryRunner.ExitCodes.Enqueue(0);
+                var retried = LoopClient(env.Url, Path.Combine(dir, "same-inventory"), new MutatingCollector(sameInventory, null), retryRunner)
+                    .RunControlledLoop(null, CancellationToken.None, null, null, new LanDriverClient.LanClosedLoopOptions());
+                T(retryRunner.Calls.Count == 2 && retried.FinalProblems.Count == 0 && retried.CompletionAudited, "DSP present from first snapshot retries after fresh scan with unchanged inventory and completes without reboot");
+                var changing = new List<List<D>>();
+                for (int i = 0; i < 6; i++) {
+                    var bus = device(busId, "parent-bus", true); bus.Version = "99.0." + i;
+                    changing.Add(new List<D> { device(childId, "dependent-child", false), bus });
+                }
+                var failures = new FakePnpInstallRunner { DefaultExitCode = 13 };
+                var broken = LoopClient(env.Url, Path.Combine(dir, "broken"), new MutatingCollector(changing, null), failures)
+                    .RunControlledLoop(null, CancellationToken.None, null, null, new LanDriverClient.LanClosedLoopOptions { MaxRounds = 10 });
+                T(failures.Calls.Count == 3, "unrelated inventory churn cannot retry a failed candidate indefinitely");
+                T(broken.FinalProblems.Count == 1 && broken.FinalProblems[0].ProblemCode == 28 && broken.FinalProblems[0].HardwareIds.Contains(childId) && Phase3Dispatch.SccmExitCode(broken) == 1, "remaining missing DSP is reported with IDs and cannot pass SCCM completion");
+            }
+        }
+
+        private static void TestExcludedPnpDspCompatibility(string root)
+        {
+            string dir = PrepareDir(Path.Combine(root, "excluded-pnp-dsp")), src = Path.Combine(dir, "src"); Directory.CreateDirectory(src);
+            string k14 = @"INTELAUDIO\DSP_CTLR_DEV_A0C8&VEN_8086&DEV_0222&SUBSYS_50AA17AA";
+            string hp = @"INTELAUDIO\DSP_CTLR_DEV_51C8&VEN_8086&DEV_0222&SUBSYS_896D103C";
+            string path = WriteInf(src, "intcoed.inf", k14, "01/01/2026", "10.29.0.12571", "NTamd64.10");
+            File.WriteAllText(path, File.ReadAllText(path).Replace("[Strings]", "Other=Install," + hp + "\n[Strings]") + "\n[ControlFlags]\nExcludeFromSelect=*\n");
+            string repo = MakeRepoFromDirs(Path.Combine(dir, "repo"), new List<string> { src });
+            var devices = new List<D> { Dev(k14, "missing-k14-dsp", "", "", true), Dev(hp, "missing-hp-dsp", "", "", true) };
+            foreach (var d in devices) { d.Error = 28; d.H.Insert(0, d.H[0] + "&REV_0020"); }
+            int probes = 0;
+            try
+            {
+                WindowsDriverPreference.TestCompatibilityProbe = (d, inf, flags) => {
+                    probes++;
+                    // Model SetupAPI's documented exclusion behaviour, not unconditional success.
+                    bool excluded = File.ReadAllText(inf).Contains("ExcludeFromSelect=*");
+                    return !excluded || (flags & 0x00000800) != 0;
+                };
+                foreach (var device in devices)
+                {
+                    using (var env = StartEnv(repo, null, null))
+                    {
+                        var runner = new FakePnpInstallRunner();
+                        var client = LoopClient(env.Url, Path.Combine(dir, device.Id), new StaticHardwareCollector(new[] { device }), runner);
+                        var response = client.Report(new[] { device }, new Machine(), CancellationToken.None, null);
+                        T(response.Candidates.Count(c => c.NeedInstall) == 1, "Code 28 DSP excluded from manual selection remains a PnP candidate: " + device.Id);
+                        var installed = client.InstallCandidates(response.Candidates, new List<D> { device }, CancellationToken.None, null);
+                        T(runner.Calls.Count == 1 && installed.InstalledSkip == 0, "excluded DSP reaches installer after downloaded-INF/native compatibility checks: " + device.Id);
+                    }
+                }
+                T(probes >= 2, "both missing DSP devices exercise native pre-install compatibility enumeration");
+                string code;
+                var wrong = Dev(@"INTELAUDIO\DSP_CTLR_DEV_FFFF&VEN_8086&DEV_0222", "wrong-dsp", "", "", true);
+                T(LanDriverClient.RevalidateExtractedInf(path, wrong, new OsTarget(), out code) != null, "including excluded PnP entries does not bypass hardware compatibility");
+            }
+            finally { WindowsDriverPreference.TestCompatibilityProbe = null; }
+        }
+
+        private static void TestActiveModelsAndMissingCompatibility(string root)
+        {
+            string dir = PrepareDir(Path.Combine(root, "active-model-audio")), src = Path.Combine(dir, "src"); Directory.CreateDirectory(src);
+            string hw = @"INTELAUDIO\FUNC_01&VEN_8086&DEV_2812&SUBSYS_80860101";
+            string good = WriteInf(src, "IntcDAud.inf", hw, "01/01/2025", "10.0.0.0", "NTamd64.10");
+            string wrong = WriteInf(src, "mshdadac.inf", hw, "01/01/2026", "32.0.0.0", "NTamd64.10.0...18362");
+            string text = File.ReadAllText(wrong).Replace("Models,NTamd64.10.0...18362", "Models,NTamd64.10.0...18362,NTamd64.10.0...19041");
+            File.WriteAllText(wrong, text + "\n[Models.NTamd64.10.0...19041]\nOther=Install,INTELAUDIO\\SGPC_FUNC_01&VEN_8086&DEV_2812&SUBSYS_80860101\n");
+            string repo = MakeRepoFromDirs(Path.Combine(dir, "repo"), new List<string> { src });
+            var missing = Dev(hw, "missing-display-audio", "", "", true); missing.Error = 28;
+            using (var env = StartEnv(repo, null, null))
+            {
+                var client = LoopClient(env.Url, Path.Combine(dir, "cache"), new StaticHardwareCollector(new[] { missing }), new FakePnpInstallRunner());
+                var candidate = FirstCandidate(client, new List<D> { missing });
+                T(candidate != null && candidate.InfRelativePath.EndsWith("IntcDAud.inf", StringComparison.OrdinalIgnoreCase), "server chooses compatible older package instead of inactive newer model ID");
+            }
+            try
+            {
+                WindowsDriverPreference.TestCompatibilityProbe = (d, path, flags) => false;
+                string code;
+                string reason = LanDriverClient.RevalidateExtractedInf(good, missing, new OsTarget { Architecture = "amd64", MajorVersion = 10, BuildNumber = 26300 }, out code);
+                T(reason != null && code == "WindowsNoCompatibleDriver", "Code 28 candidates still require native compatibility");
+            }
+            finally { WindowsDriverPreference.TestCompatibilityProbe = null; }
+            var success = new DriverInstallEvent { EventId = "a", Device = "speaker", Status = "installed", Utc = "2026-10-29T09:00:00Z" };
+            var pending = new DriverInstallEvent { EventId = "b", Device = "display", Status = "unverified", Utc = "2026-10-29T09:01:00Z" };
+            T(InstallLogIdentity.Summarize(new[] { success, pending }, "test").Status == "unverified", "partial success cannot hide an unverified audio device");
+        }
+
+        private static void TestSccmDelayedAudioEnumeration(string root)
+        {
+            string dir = PrepareDir(Path.Combine(root, "sccm-delayed-audio"));
+            string hw = @"INTELAUDIO\FUNC_01&VEN_8086&DEV_2812&SUBSYS_80860101&REV_1000";
+            string src = Path.Combine(dir, "src"); Directory.CreateDirectory(src);
+            WriteInf(src, "mshdadac.inf", hw, "01/01/2026", "32.0.0.0", "NTamd64.10");
+            string repo = MakeRepoFromDirs(Path.Combine(dir, "repo"), new List<string> { src });
+            using (var env = StartEnv(repo, null, null))
+            {
+                var missing = Dev(hw, "delayed-audio", "", "", true);
+                var healthy = Dev(hw, "delayed-audio", "oem-audio.inf", "32.0.0.0", false);
+                var collector = new MutatingCollector(new List<List<D>> {
+                    new List<D>(), new List<D>(), new List<D> { missing }, new List<D> { healthy }
+                }, null);
+                var runner = new FakePnpInstallRunner { DefaultExitCode = 0 };
+                var client = LoopClient(env.Url, Path.Combine(dir, "cache"), collector, runner);
+                var opts = Phase3Dispatch.SccmLoopOptions(); opts.QuietDelayMs = 0;
+                T(opts.QuietPasses >= 4 && opts.MaxRounds > 5 && opts.RescanBeforeCollection, "SCCM requires settled PnP scans and supports deeper dependency chains");
+                T(Phase3Dispatch.UseSccmDeployment(new O { Deploy = true, Lan = "http://server" }, false), "legacy --deployment --lan uses complete SCCM loop");
+                T(!Phase3Dispatch.UseSccmDeployment(new O { Deploy = true, Repo = "offline" }, true), "offline deployment preserves its own flow");
+                T(!Phase3Dispatch.UseSccmDeployment(new O { Deploy = true, WhatIf = true, Lan = "http://server" }, false), "dry-run remains non-installing");
+                var result = client.RunControlledLoop(null, CancellationToken.None, null, null, opts);
+                T(runner.Calls.Count == 1 && result.InstalledOk == 1, "display audio appearing after two empty scans is installed");
+                T(result.NoCandidatesRemaining && result.RemainingProblemDevices == 0 && string.IsNullOrEmpty(result.Error), "settled healthy completion");
+                T(Phase3Dispatch.SccmExitCode(result) == 0, "healthy deployment returns success");
+
+                var absent = Dev(@"ACPI\MISSING999", "no-package", "", "", true); absent.Error = 28;
+                var brokenClient = LoopClient(env.Url, Path.Combine(dir, "broken"), new MutatingCollector(new List<List<D>> { new List<D> { absent } }, null), runner);
+                var broken = brokenClient.RunControlledLoop(null, CancellationToken.None, null, null, opts);
+                T(broken.RemainingProblemDevices == 1 && Phase3Dispatch.SccmExitCode(broken) == 1, "unmatched Code 28 cannot report SCCM success");
+            }
+        }
+
         private static void TestClosedLoopNewDeviceThenDone(string root)
         {
             string dir = PrepareDir(Path.Combine(root, "loop-new"));
@@ -1657,10 +2142,10 @@ namespace UDA
                 var collector = new MutatingCollector(new List<List<D>> { new List<D> { Dev(hw, "LD", "", "", false) } }, null);
                 var client = LoopClient(env.Url, Path.Combine(dir, "staging"), collector, runner);
                 var loop = client.RunControlledLoop(null, CancellationToken.None, null, null, null);
-                T(loop.NoCandidatesRemaining, "loop terminated despite device still missing");
-                T(loop.Rounds == 1, "only one round processed the item, rounds=" + loop.Rounds);
-                T(loop.InstalledOk == 1, "item installed once, ok=" + loop.InstalledOk);
-                T(runner.Calls.Count == 1, "exactly one install call, calls=" + runner.Calls.Count);
+                T(!loop.NoCandidatesRemaining && loop.FinalProblems.Count > 0, "still missing candidate is reported unresolved instead of falsely claiming no candidates");
+                T(loop.Rounds == 3, "still-missing item receives bounded fresh-scan retries, rounds=" + loop.Rounds);
+                T(loop.InstalledOk == 3, "command results retained across bounded attempts, ok=" + loop.InstalledOk);
+                T(runner.Calls.Count == 3, "same unbound candidate capped at three calls, calls=" + runner.Calls.Count);
                 T(loop.ProcessedKeys.Count == 1, "one processed key, keys=" + loop.ProcessedKeys.Count);
             }
         }
@@ -2079,6 +2564,398 @@ namespace UDA
 
         // A failed repo reload (corrupt manifest) keeps the previous usable repo: the server keeps
         // serving the old index, the process stays up, and the failure is visible in health.
+        private static AiAutoTaskSettings AiPlan(AiDriverTaskRunner runner)
+        {
+            var json = new JavaScriptSerializer();
+            var status = json.Deserialize<Dictionary<string, object>>(json.Serialize(runner.ScheduleStatus()));
+            return json.Deserialize<AiAutoTaskSettings>(json.Serialize(status["settings"]));
+        }
+        private static void TestAiAutoSchedule(string root)
+        {
+            DateTime utc = DateTime.Parse("2026-10-28T17:30:00Z", CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind);
+            var rule = new AiAutoTaskRule { time = "02:00" };
+            T(AiAutoTaskSchedule.Next(rule, utc, false) == utc.AddMinutes(30), "daily schedule uses explicit UTC+8 across midnight");
+            rule.frequency = "weekly"; rule.weekDay = 1; rule.time = "09:00";
+            T(AiAutoTaskSchedule.Next(rule, utc, false).ToString("o").StartsWith("2026-11-02T01:00:00"), "weekly schedule chooses next Monday in Beijing time");
+            rule.frequency = "interval"; rule.intervalMinutes = 30; rule.nextRunUtc = "2026-10-28T01:00:00Z";
+            T(AiAutoTaskSchedule.Next(rule, DateTime.Parse("2026-10-28T02:11:00Z").ToUniversalTime(), true).ToString("o").StartsWith("2026-10-28T02:30:00"), "interval skips missed slots without a catch-up storm");
+            var invalid = new AiAutoTaskSettings(); invalid.news.time = "24:00";
+            bool rejected = false; try { AiAutoTaskSchedule.Validate(invalid); } catch (ArgumentException) { rejected = true; }
+            T(rejected, "invalid schedule time rejected");
+            invalid.news.time = "03:00"; invalid.news.deviceTypes = new List<string> { "all", "display" };
+            rejected = false; try { AiAutoTaskSchedule.Validate(invalid); } catch (ArgumentException) { rejected = true; }
+            T(rejected, "ambiguous all-plus-specific scope rejected");
+            T(AiTaskDeviceTypes.Matches(new OfflineRepoEntry { Class = "Display" }, new[] { "display" }) && !AiTaskDeviceTypes.Matches(new OfflineRepoEntry { Class = "Net" }, new[] { "display" }), "device filter distinguishes display and network classes");
+            T(AiTaskDeviceTypes.Category(new OfflineRepoEntry { Class = "Extension" }) == "other" && AiTaskDeviceTypes.Category(new OfflineRepoEntry { Class = "SCSIAdapter" }) == "storage", "extension and storage classes map predictably");
+            string dir = PrepareDir(Path.Combine(root, "ai-auto-plan"));
+            DateTime clock = DateTime.Parse("2026-10-28T00:00:00Z", CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind);
+            int releaseRuns = 0, newsRuns = 0;
+            using (var runner = new AiDriverTaskRunner(dir, () => null, CancellationToken.None))
+            {
+                runner.UtcNow = () => clock;
+                runner.TestRun = (kind, token, progress) => { if (kind == "releases") Interlocked.Increment(ref releaseRuns); else Interlocked.Increment(ref newsRuns); return "schedule test complete"; };
+                var plan = AiPlan(runner);
+                plan.enabled = true; plan.releases.enabled = true; plan.releases.time = plan.news.time = "09:00";
+                plan.releases.deviceTypes = new List<string> { "display" }; plan.news.deviceTypes = new List<string> { "network" };
+                plan.news.frequency = "interval"; plan.news.intervalMinutes = 30;
+                runner.SaveSchedule(plan);
+                T(AiPlan(runner).news.nextRunUtc.StartsWith("2026-10-28T01:00:00"), "saved interval plan anchors first execution to selected time");
+                runner.RunSchedules(); T(releaseRuns == 0 && newsRuns == 0, "scheduler never runs before due time");
+                clock = clock.AddHours(1); runner.RunSchedules();
+                T(AwaitAi(() => releaseRuns == 1 && newsRuns == 1 && !runner.IsRunning), "independent automatic plans dispatch both task types when due");
+                T(AiJobs(runner).All(j => j.scheduled && j.deviceTypes.Count == 1), "each automatic job snapshots its chosen device types");
+                runner.RunSchedules(); T(releaseRuns == 1 && newsRuns == 1, "same due time slot is not dispatched twice");
+                using (var restart = new AiDriverTaskRunner(dir, () => null, CancellationToken.None))
+                {
+                    restart.UtcNow = () => clock; restart.TestRun = runner.TestRun; restart.RunSchedules();
+                    T(releaseRuns == 1 && newsRuns == 1, "persisted next-run state prevents duplicate dispatch after restart");
+                }
+                clock = clock.AddMinutes(30); runner.RunSchedules();
+                T(AwaitAi(() => newsRuns == 2 && !runner.IsRunning) && releaseRuns == 1, "interval plan does not change daily plan frequency");
+                string intervalNext = AiPlan(runner).news.nextRunUtc;
+                var unrelated = AiPlan(runner); unrelated.releases.time = "10:00"; runner.SaveSchedule(unrelated);
+                T(AiPlan(runner).news.nextRunUtc == intervalNext, "editing one plan does not reset the other plan's interval anchor");
+                var disabled = AiPlan(runner); disabled.enabled = false; runner.SaveSchedule(disabled);
+                clock = clock.AddDays(3); runner.RunSchedules();
+                T(newsRuns == 2 && releaseRuns == 1 && string.IsNullOrEmpty(AiPlan(runner).news.nextRunUtc), "global off switch stops all future automatic execution");
+                T(runner.Begin("news", false) && AwaitAi(() => newsRuns == 3 && !runner.IsRunning), "manual jobs still work while automatic scheduling is disabled");
+                T(!runner.Begin("news", true), "disabled schedule cannot be bypassed with scheduled Begin");
+                var moduleOff = AiPlan(runner); moduleOff.tasksEnabled = false; runner.SaveSchedule(moduleOff);
+                bool moduleRejected = false; try { runner.Begin("releases", false); } catch (InvalidOperationException) { moduleRejected = true; }
+                T(moduleRejected, "module disabled rejects manual AI task execution");
+                rejected = false; try { runner.SaveSchedule(disabled); } catch (InvalidOperationException) { rejected = true; }
+                T(rejected, "stale admin schedule revision cannot overwrite newer settings");
+            }
+            string src = Path.Combine(dir, "src"); Directory.CreateDirectory(src);
+            for (int i = 0; i < 15; i++) WriteInf(src, "net" + i + ".inf", "PCI\\VEN_ABCD&DEV_" + (1000 + i), "03/14/2026", "1.0.0.0", "NTamd64.10");
+            string display = WriteInf(src, "display.inf", "PCI\\VEN_DDDD&DEV_1111", "03/14/2026", "1.0.0.0", "NTamd64.10");
+            File.WriteAllText(display, File.ReadAllText(display).Replace("Class=Net", "Class=Display"));
+            string repoRoot = MakeRepo(Path.Combine(dir, "repo"), src);
+            using (var repo = OfflineRepo.Open(repoRoot, _log))
+            try
+            {
+                AiTaskExecution.DeviceTypes = new List<string> { "network" }; AiTaskExecution.RefreshAllNews = true;
+                AiDriverTasks.Releases(repoRoot, repo, CancellationToken.None, delegate { });
+                T(DriverReleasePolicies.Load(repoRoot).Count > 0 && DriverReleasePolicies.Load(repoRoot).All(p => !p.HardwareId.Contains("VEN_DDDD")), "scheduled version policies only affect selected device types");
+                int searches = 0; DriverNewsReader.TestSearch = delegate { Interlocked.Increment(ref searches); throw new IOException("synthetic no source"); };
+                AiDriverTasks.News(repoRoot, repo, CancellationToken.None, delegate { });
+                T(searches == 15, "automatic news plan covers more than twelve selected hardware groups");
+                AiDriverTasks.News(repoRoot, repo, CancellationToken.None, delegate { });
+                T(searches == 30, "automatic frequency overrides the former fixed daily per-hardware cooldown");
+                AiTaskExecution.DeviceTypes = null; AiTaskExecution.RefreshAllNews = false;
+                AiDriverTasks.Releases(repoRoot, repo, CancellationToken.None, delegate { });
+                T(DriverReleasePolicies.Load(repoRoot).Any(p => p.HardwareId.Contains("VEN_DDDD")), "manual version task remains unfiltered");
+            }
+            finally { AiTaskExecution.DeviceTypes = null; AiTaskExecution.RefreshAllNews = false; DriverNewsReader.TestSearch = null; }
+        }
+
+        private static void TestNewsSourcesAndInstallSessions(string root)
+        {
+            try
+            {
+                int requests = 0;
+                DriverNewsReader.TestFetch = (uri, token) => {
+                    Interlocked.Increment(ref requests);
+                    if (uri.Host.Contains("bing.com")) throw new IOException("search blocked");
+                    if (uri.AbsolutePath.Contains("processFind")) return "<html><a href='/download/driverResults.aspx/123/en-us'>Driver results</a></html>";
+                    if (uri.AbsolutePath.Contains("getDownloadDetails")) return J(new { driverDetails = new { IDS = new[] { new { downloadInfo = new { Success = "1", Name = "GeForce driver", Version = "999.99", ReleaseNotes = "Driver 999.99 fixes a display crash. " + new string('x', 150), series = new[] { new { productName = "GeForce RTX 4070" } } } } } } });
+                    if (uri.AbsolutePath.Contains("driverResults")) return "<html><title>Official driver</title><nav>noise</nav><main>GeForce RTX 4070 driver 999.99 fixes a display crash. " + new string('x', 150) + "</main></html>";
+                    return "<html><main>no announcement</main></html>";
+                };
+                var sources = DriverNewsReader.Search("NVIDIA GeForce RTX 4070", CancellationToken.None);
+                T(sources.Any(d => d.Url.Contains("getDownloadDetails") && d.Text.Contains("fixes") && d.Text.Contains("4070")), "direct official source works when search engines are unavailable");
+                T(!sources.Any(d => d.Text.Contains("noise")), "navigation is removed from announcement evidence");
+                T(DriverNewsReader.OfficialSeeds("AMD Radeon RX 6600").Any(u => u.Host.EndsWith("amd.com")), "AMD has an independent official release-note source");
+            }
+            finally { DriverNewsReader.TestFetch = null; }
+            T(!AiDriverTasks.QuoteApplies("NVIDIA GeForce RTX 4070", "Fix crash on RTX 5090") && AiDriverTasks.QuoteApplies("NVIDIA GeForce RTX 4070", "Fix crash on RTX 40 Series"), "source with all supported GPUs cannot turn a different-model fix into this model's alert");
+            string id = Guid.NewGuid().ToString("N");
+            var first = new DriverInstallEvent { EventId = Guid.NewGuid().ToString("N"), RunId = id, Machine = "PC1", Mac = "AA:BB:CC:DD:EE:FF", Status = "installed", Device = "GPU", Detail = "first", Utc = "2026-10-27T01:00:00Z" };
+            var fragment = new DriverInstallEvent { EventId = Guid.NewGuid().ToString("N"), RunId = id, Machine = "pc1", Mac = "112233445566,AABBCCDDEEFF", Status = "log", Detail = "second", Utc = "2026-10-27T01:00:01Z" };
+            var later = new DriverInstallEvent { EventId = Guid.NewGuid().ToString("N"), RunId = Guid.NewGuid().ToString("N"), Machine = "PC1", Mac = "112233445566", Status = "installed", Device = "GPU", Utc = "2026-10-28T01:00:00Z" };
+            var distinct = new DriverInstallEvent { EventId = Guid.NewGuid().ToString("N"), RunId = Guid.NewGuid().ToString("N"), Machine = "PC1", Mac = "998877665544", Status = "installed", Device = "GPU", Utc = later.Utc };
+            var rows = new[] { first, fragment, later, distinct }; var identity = InstallLogIdentity.Resolve(rows);
+            T(identity[first] == identity[fragment] && identity[first] == identity[later], "MAC list additions/order changes and later runs resolve to one physical client");
+            T(identity[first] != identity[distinct], "unrelated same-name machine with distinct MAC is not merged");
+            var strongA = new DriverInstallEvent { Machine = "PC1", MachineId = new string('a', 64), RunId = Guid.NewGuid().ToString("N"), Mac = "AA:BB:CC:DD:EE:FF" };
+            var strongB = new DriverInstallEvent { Machine = "PC1", MachineId = new string('b', 64), RunId = Guid.NewGuid().ToString("N"), Mac = "AA:BB:CC:DD:EE:FF" };
+            var strongIds = InstallLogIdentity.Resolve(new[] { strongA, strongB });
+            T(strongIds[strongA] != strongIds[strongB], "distinct strong machine IDs cannot be merged by a duplicated virtual MAC");
+            var summary = InstallLogIdentity.Summarize(new[] { first, fragment }, identity[first]);
+            T(summary.FragmentCount == 2 && summary.Detail.Contains("first") && summary.Detail.Contains("second"), "one session summary keeps all uploaded chunks");
+            string dir = PrepareDir(Path.Combine(root, "install-session-api")), src = Path.Combine(dir, "src"); Directory.CreateDirectory(src);
+            WriteInf(src, "dev.inf", "PCI\\VEN_F111&DEV_F991", "03/14/2026", "2.0.0.0", "NTamd64.10"); string repo = MakeRepo(Path.Combine(dir, "repo"), src);
+            foreach (var e in rows) ServerStorage.Write(repo, "install-events/" + e.EventId + ".json", J(e), true);
+            using (var env = StartEnv(repo, "session-token", null))
+            {
+                var response = HttpGet(env.Url + "/api/admin/install-logs?pageSize=1", "session-token");
+                var data = new JavaScriptSerializer().Deserialize<Dictionary<string, object>>(response.Item2);
+                T(Convert.ToInt32(data["total"]) == 3 && Convert.ToInt32(data["machines"]) == 2, "API paginates sessions and counts physical machines instead of chunks");
+                var full = HttpGet(env.Url + "/api/admin/install-logs?session=" + id, "session-token");
+                T(Convert.ToInt32(new JavaScriptSerializer().Deserialize<Dictionary<string, object>>(full.Item2)["total"]) == 2, "complete session API returns all original events");
+                string historicalId = Guid.NewGuid().ToString("N"); var historical = new DriverInstallEvent { EventId = historicalId, RunId = Guid.NewGuid().ToString("N"), Machine = "OLD-TEST", MachineId = new string('c', 64), Device = "NIC", Status = "installed", CountInUsage = false, Detail = "historical success participates in deduplicated usage", Utc = first.Utc };
+                T(HttpPost(env.Url + "/api/admin/install-log-recovery", J(new[] { historical }), null).Item1 == 401, "historical log import requires administrator authentication");
+                var imported = HttpPostProtocol(env.Url + "/api/admin/install-log-recovery", J(new[] { historical }), "session-token", "1");
+                var again = HttpPostProtocol(env.Url + "/api/admin/install-log-recovery", J(new[] { historical }), "session-token", "1");
+                T(imported.Item1 == 200 && again.Item2.Contains("\"skipped\":1"), "historical import preserves event IDs and is idempotent");
+                var usage = new JavaScriptSerializer().Deserialize<Dictionary<string, object>>(HttpGet(env.Url + "/api/admin/install-logs", "session-token").Item2);
+                T(Convert.ToInt32(usage["machines"]) == 3 && Convert.ToInt32(usage["hardware"]) == 4 && Convert.ToInt32(usage["runs"]) == 4 && Convert.ToInt32(usage["recoveredEvents"]) == 1, "recovered success counts once despite legacy false flag and repeated import");
+                var legacy = new DriverInstallEvent { EventId = Guid.NewGuid().ToString("N"), RunId = Guid.NewGuid().ToString("N"), Machine = "LEGACY", MachineId = new string('d', 64), Device = "GPU", Status = "updated", Update = true, CountInUsage = false, RecoverySource = "旧版补迁（不计安装统计）", Utc = first.Utc };
+                var runtime = new DriverInstallEvent { EventId = Guid.NewGuid().ToString("N"), RunId = Guid.NewGuid().ToString("N"), Machine = "LOG-ONLY", MachineId = new string('e', 64), Status = "log", CountInUsage = false, RecoverySource = "历史原始运行日志", Utc = first.Utc, Detail = "plain text must never invent installed drivers" };
+                foreach (var e in new[] { legacy, runtime }) ServerStorage.Write(repo, "install-events/" + e.EventId + ".json", J(e), true);
+                usage = new JavaScriptSerializer().Deserialize<Dictionary<string, object>>(HttpGet(env.Url + "/api/admin/install-logs", "session-token").Item2);
+                T(Convert.ToInt32(usage["machines"]) == 5 && Convert.ToInt32(usage["hardware"]) == 5 && Convert.ToInt32(usage["updates"]) == 1 && Convert.ToInt32(usage["runs"]) == 6 && Convert.ToInt32(usage["recoveredEvents"]) == 3, "already imported legacy rows count without rewrite; log-only machine counts without inventing installs");
+                var live = new DriverInstallEvent { EventId = Guid.NewGuid().ToString("N"), RunId = Guid.NewGuid().ToString("N"), Machine = historical.Machine, MachineId = historical.MachineId, Device = historical.Device, Status = "installed", Utc = later.Utc };
+                ServerStorage.Write(repo, "install-events/" + live.EventId + ".json", J(live), true);
+                usage = new JavaScriptSerializer().Deserialize<Dictionary<string, object>>(HttpGet(env.Url + "/api/admin/install-logs", "session-token").Item2);
+                T(Convert.ToInt32(usage["machines"]) == 5 && Convert.ToInt32(usage["hardware"]) == 6 && Convert.ToInt32(usage["runs"]) == 7 && Convert.ToInt32(usage["recoveredEvents"]) == 3, "same machine/device in a later task counts again while physical machine remains deduplicated");
+                var duplicateFragment = new DriverInstallEvent { EventId = Guid.NewGuid().ToString("N"), RunId = live.RunId, Machine = live.Machine, MachineId = live.MachineId, Device = live.Device, Status = "installed", Utc = live.Utc };
+                ServerStorage.Write(repo, "install-events/" + duplicateFragment.EventId + ".json", J(duplicateFragment), true);
+                usage = new JavaScriptSerializer().Deserialize<Dictionary<string, object>>(HttpGet(env.Url + "/api/admin/install-logs", "session-token").Item2);
+                T(Convert.ToInt32(usage["hardware"]) == 6 && Convert.ToInt32(usage["runs"]) == 7, "multiple success fragments within one task do not increase task or driver operation counts");
+                var secondUpdate = new DriverInstallEvent { EventId = Guid.NewGuid().ToString("N"), RunId = Guid.NewGuid().ToString("N"), Machine = legacy.Machine, MachineId = legacy.MachineId, Device = legacy.Device, Status = "updated", CountInUsage = false, RecoverySource = legacy.RecoverySource, Utc = later.Utc };
+                ServerStorage.Write(repo, "install-events/" + secondUpdate.EventId + ".json", J(secondUpdate), true);
+                usage = new JavaScriptSerializer().Deserialize<Dictionary<string, object>>(HttpGet(env.Url + "/api/admin/install-logs", "session-token").Item2);
+                T(Convert.ToInt32(usage["machines"]) == 5 && Convert.ToInt32(usage["hardware"]) == 7 && Convert.ToInt32(usage["updates"]) == 2 && Convert.ToInt32(usage["runs"]) == 8, "same historical device updated on a later day has an independent task and update count");
+                var sameSession = HttpGet(env.Url + "/api/admin/install-logs?session=" + live.RunId, "session-token");
+                T(Convert.ToInt32(new JavaScriptSerializer().Deserialize<Dictionary<string, object>>(sameSession.Item2)["total"]) == 2, "task details include own fragments without absorbing other time periods");
+                var stored = new JavaScriptSerializer().Deserialize<DriverInstallEvent>(ServerStorage.Read(repo, "install-events/" + legacy.EventId + ".json"));
+                T(!stored.CountInUsage && stored.RecoverySource == legacy.RecoverySource, "legacy evidence remains immutable while updated usage policy counts it");
+                foreach (string status in new[] { "log", "failed", "skipped", "unverified" })
+                {
+                    var used = new DriverInstallEvent { EventId = Guid.NewGuid().ToString("N"), RunId = Guid.NewGuid().ToString("N"), Machine = "Used-" + status, MachineId = Guid.NewGuid().ToString("N"), Status = status, Utc = later.Utc };
+                    ServerStorage.Write(repo, "install-events/" + used.EventId + ".json", J(used), true);
+                    used.EventId = Guid.NewGuid().ToString("N"); ServerStorage.Write(repo, "install-events/" + used.EventId + ".json", J(used), true);
+                }
+                usage = new JavaScriptSerializer().Deserialize<Dictionary<string, object>>(HttpGet(env.Url + "/api/admin/install-logs", "session-token").Item2);
+                T(Convert.ToInt32(usage["machines"]) == 9 && Convert.ToInt32(usage["hardware"]) == 7 && Convert.ToInt32(usage["updates"]) == 2, "log-only, failed, skipped and unverified clients count once without inventing successful installs");
+            }
+        }
+
+        private static AiTaskRecord[] AiJobs(AiDriverTaskRunner runner)
+        {
+            var json = new JavaScriptSerializer();
+            var status = json.Deserialize<Dictionary<string, object>>(json.Serialize(runner.Status()));
+            return ((System.Collections.IEnumerable)status["tasks"]).Cast<object>().Select(v => json.Deserialize<AiTaskRecord>(json.Serialize(v))).ToArray();
+        }
+        private static bool AwaitAi(Func<bool> condition)
+        {
+            for (int i = 0; i < 300; i++) { if (condition()) return true; Thread.Sleep(10); }
+            return condition();
+        }
+        private static void TestAiTaskControl(string root)
+        {
+            string dir = PrepareDir(Path.Combine(root, "ai-task-control"));
+            using (var stop = new CancellationTokenSource())
+            using (var runner = new AiDriverTaskRunner(dir, () => null, stop.Token))
+            using (var started = new CountdownEvent(2))
+            {
+                int steps = 0;
+                runner.TestRun = (kind, token, progress) => {
+                    started.Signal();
+                    if (kind == "news") { token.WaitHandle.WaitOne(); token.ThrowIfCancellationRequested(); }
+                    for (int i = 0; i < 10000; i++) { AiTaskExecution.Check("test step", i, 10000); Interlocked.Increment(ref steps); Thread.Sleep(5); }
+                    return "finished";
+                };
+                string releaseId = "", newsId = "", duplicateId = "";
+                T(runner.Begin("releases", false, out releaseId) && runner.Begin("news", false, out newsId), "different AI jobs start concurrently");
+                T(started.Wait(3000), "both AI workers run without a global busy flag");
+                T(!runner.Begin("releases", false, out duplicateId) && duplicateId == releaseId, "same-kind duplicate returns the existing task id");
+                T(AwaitAi(() => Volatile.Read(ref steps) > 2), "AI worker reports actual progress");
+                T(runner.Control(releaseId, "pause") && AwaitAi(() => AiJobs(runner).First(j => j.id == releaseId).state == "paused"), "pause reaches a cooperative boundary");
+                int atPause = steps; Thread.Sleep(70);
+                T(steps == atPause, "paused AI worker makes no further progress");
+                T(runner.Control(newsId, "cancel") && AwaitAi(() => AiJobs(runner).First(j => j.id == newsId).state == "cancelled"), "network-wait style worker responds to cancellation");
+                T(AiJobs(runner).First(j => j.id == releaseId).state == "paused", "cancelling one job does not cancel the other");
+                runner.StaleAfter = TimeSpan.FromMilliseconds(20); Thread.Sleep(40); runner.Tick();
+                T(AiJobs(runner).First(j => j.id == releaseId).state == "paused", "paused time is excluded from the no-progress watchdog");
+                runner.StaleAfter = TimeSpan.FromMinutes(10);
+                T(runner.Control(releaseId, "resume") && AwaitAi(() => steps > atPause), "resume continues the existing task");
+                T(runner.Control(releaseId, "pause") && AwaitAi(() => AiJobs(runner).First(j => j.id == releaseId).state == "paused"), "second pause is acknowledged");
+                var modulePlan = AiPlan(runner); modulePlan.tasksEnabled = false; runner.SaveSchedule(modulePlan);
+                T(AwaitAi(() => !runner.IsRunning), "module disable cancels and wakes paused workers");
+                modulePlan = AiPlan(runner); modulePlan.tasksEnabled = true; runner.SaveSchedule(modulePlan);
+                T(AwaitAi(() => AiJobs(runner).All(j => j.finishedUtc.Length > 0)), "all terminal jobs have completion timestamps");
+                T(AiJobs(runner).All(j => j.logs.Count > 1), "per-task timestamped logs retained");
+                runner.Tick();
+                T(AwaitAi(() => { runner.Tick(); return Directory.GetFiles(dir, "repo.ai-task.*.json").Length == 2; }), "task history persists independently of in-memory running state");
+                runner.TestRun = (kind, token, progress) => { throw new IOException("synthetic job failure"); };
+                string failedId; runner.Begin("releases", false, out failedId);
+                T(AwaitAi(() => AiJobs(runner).First(j => j.id == failedId).state == "failed") && !runner.IsRunning, "exception always clears active state");
+                runner.TestRun = (kind, token, progress) => "completed immediately";
+                string completedId; runner.Begin("releases", false, out completedId);
+                T(AwaitAi(() => AiJobs(runner).First(j => j.id == completedId).state == "completed") && !runner.IsRunning, "completed task immediately permits another same-kind job");
+                runner.TestRun = (kind, token, progress) => { token.WaitHandle.WaitOne(); token.ThrowIfCancellationRequested(); return "unreachable"; };
+                string timeoutId; runner.Begin("releases", false, out timeoutId);
+                runner.StaleAfter = TimeSpan.FromMilliseconds(20); Thread.Sleep(40); runner.Tick();
+                T(AwaitAi(() => AiJobs(runner).First(j => j.id == timeoutId).state == "timedout") && !runner.IsRunning, "no-progress watchdog cancels a stalled cooperative worker");
+            }
+            using (var finish = new ManualResetEventSlim(false))
+            using (var runner = new AiDriverTaskRunner(dir, () => null, CancellationToken.None))
+            {
+                runner.TestRun = (kind, token, progress) => { finish.Wait(token); return "finished despite persistence outage"; };
+                string id; runner.Begin("releases", false, out id);
+                Directory.CreateDirectory(Path.Combine(dir, "repo.ai-task." + id + ".json"));
+                finish.Set();
+                T(AwaitAi(() => AiJobs(runner).First(j => j.id == id).state == "completed") && !runner.IsRunning,
+                    "history persistence failure cannot keep a completed task marked running");
+            }
+            string interruptedId = Guid.NewGuid().ToString("N");
+            ServerStorage.Write(dir, "repo.ai-task." + interruptedId + ".json", J(new AiTaskRecord { id = interruptedId, action = "news", state = "running", startedUtc = DateTime.UtcNow.ToString("o") }), false);
+            using (var recovered = new AiDriverTaskRunner(dir, () => null, CancellationToken.None))
+            {
+                recovered.Start();
+                T(!recovered.IsRunning && AiJobs(recovered).First(j => j.id == interruptedId).state == "interrupted", "restart converts stale persisted running status to interrupted without blocking new jobs");
+            }
+            string src = Path.Combine(dir, "src"); Directory.CreateDirectory(src);
+            WriteInf(src, "dev.inf", "PCI\\VEN_F111&DEV_F119", "03/14/2026", "2.0.0.0", "NTamd64.10");
+            string repo = MakeRepo(Path.Combine(dir, "repo"), src);
+            using (var env = StartEnv(repo, "ai-control-token", null))
+            {
+                var field = typeof(LanDriverServer).GetField("_aiTasks", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+                var runner = (AiDriverTaskRunner)field.GetValue(env.Server);
+                runner.TestRun = (kind, token, progress) => { while (true) { token.ThrowIfCancellationRequested(); AiTaskExecution.Check("http-worker", 1, 3); Thread.Sleep(5); } };
+                T(HttpPost(env.Url + "/api/admin/ai/tasks", "{\"action\":\"news\"}", null).Item1 == 401, "AI task creation requires authentication");
+                var begun = HttpPost(env.Url + "/api/admin/ai/tasks", "{\"action\":\"news\"}", "ai-control-token");
+                T(begun.Item1 == 202, "AI task HTTP start is asynchronous");
+                string id = Convert.ToString(new JavaScriptSerializer().Deserialize<Dictionary<string, object>>(begun.Item2)["id"]);
+                T(HttpGet(env.Url + "/api/admin/ai/status", null).Item1 == 401, "task logs require admin authentication");
+                T(HttpPost(env.Url + "/api/admin/ai/tasks", J(new { action = "cancel", id }), null).Item1 == 401, "task cancellation requires admin authentication");
+                T(HttpPost(env.Url + "/api/admin/ai/tasks", J(new { action = "pause", id }), "ai-control-token").Item1 == 202 && AwaitAi(() => AiJobs(runner).First(j => j.id == id).state == "paused"), "pause works through authenticated HTTP API");
+                T(HttpGet(env.Url + "/api/admin/ai/status", "ai-control-token").Item2.Contains("http-worker"), "HTTP status returns individual task progress and logs");
+                T(HttpPost(env.Url + "/api/admin/ai/tasks", J(new { action = "cancel", id }), "ai-control-token").Item1 == 202 && AwaitAi(() => !runner.IsRunning), "cancel HTTP API releases paused task");
+                T(HttpGet(env.Url + "/api/health", null).Item1 == 200, "AI task control leaves client server available");
+                T(HttpGet(env.Url + "/api/admin/ai/schedule", null).Item1 == 401, "automatic plan configuration requires authentication");
+                var scheduleResponse = HttpGet(env.Url + "/api/admin/ai/schedule", "ai-control-token");
+                T(scheduleResponse.Item1 == 200 && scheduleResponse.Item2.Contains("UTC+8"), "schedule API exposes time zone and rules");
+                var plan = AiPlan(runner); plan.enabled = false;
+                T(HttpPost(env.Url + "/api/admin/ai/schedule", J(plan), "ai-control-token").Item1 == 200 && !AiPlan(runner).enabled, "authenticated administrator can persist the global schedule off switch");
+            }
+        }
+
+        private static void TestAiTasksAndInbox(string root)
+        {
+            string dir = PrepareDir(Path.Combine(root, "ai-inbox"));
+            string src = Path.Combine(dir, "src"); Directory.CreateDirectory(src);
+            string id = "PCI\\VEN_F111&DEV_F112";
+            WriteInf(src, "old.inf", id + ",PCI\\CC_0200", "03/14/2025", "1.0.0.0", "NTamd64.10");
+            string repoRoot = MakeRepo(Path.Combine(dir, "repo"), src);
+            using (var repo = OfflineRepo.Open(repoRoot, _log))
+            {
+                foreach (var e in repo.Manifest.Entries) e.SignatureStatus = "deferred";
+                DriverNewsReader.TestSearch = delegate { throw new IOException("offline"); };
+                AiDriverTasks.Releases(repoRoot, repo, CancellationToken.None, delegate { });
+                var policies = DriverReleasePolicies.Load(repoRoot);
+                T(policies.Count > 0 && policies.All(p => p.StableHash == p.LatestHash && p.StableHash.Length > 0), "single version sets both channels without internet");
+                T(policies.Any(p => p.HardwareId.Contains("CC_0200")), "deferred signatures and actual INF compatible IDs receive durable channel policies");
+            }
+            WriteInf(src, "new.inf", id + ",PCI\\CC_0200", "03/14/2026", "2.0.0.0", "NTamd64.10");
+            MakeRepo(repoRoot, src);
+            using (var repo = OfflineRepo.Open(repoRoot, _log))
+            {
+                try
+                {
+                    string newest = repo.Manifest.Entries.First(e => e.DriverVerVersion == "2.0.0.0").ContentHash;
+                    bool savedBeforeNetwork = false;
+                    DriverNewsReader.TestSearch = delegate { savedBeforeNetwork = DriverReleasePolicies.Load(repoRoot).All(p => p.LatestHash == newest); throw new IOException("offline"); };
+                    AiDriverTasks.Releases(repoRoot, repo, CancellationToken.None, delegate { });
+                    T(savedBeforeNetwork, "all deterministic latest policies are durable before network analysis starts");
+                    T(DriverReleasePolicies.Load(repoRoot).All(p => p.LatestHash == newest), "internet failure cannot prevent deterministic warehouse latest selection");
+                    string older = repo.Manifest.Entries.First(e => e.DriverVerVersion == "1.0.0.0").ContentHash;
+                    string text = "Test Device " + id + " driver 1.0.0.0 is the recommended stable driver. Version 3.0.0.0 fixes a minor display artifact. Version 4.0.0.0 fixes CVE-2026-12345 security vulnerability.";
+                    var sources = new List<DriverNewsSource> { new DriverNewsSource { Url = "https://www.intel.com/test-notes", Text = text } };
+                    DriverNewsReader.TestSearch = delegate { return sources; };
+                    AiDriverTasks.TestChat = delegate(string r, string prompt, object data, CancellationToken token) {
+                        if (prompt.Contains("stable driver")) return new Dictionary<string, object> { { "stableHash", " " + older.ToUpperInvariant() + " " }, { "sourceUrl", sources[0].Url }, { "quote", "driver 1.0.0.0 is the recommended stable driver." }, { "reason", "official recommendation" } };
+                        return new Dictionary<string, object> { { "updates", new[] {
+                            new Dictionary<string, object> { { "version", "3.0.0.0" }, { "summary", "修复显示画面异常问题" }, { "sourceUrl", sources[0].Url }, { "quote", "Version 3.0.0.0 fixes a minor display artifact." }, { "critical", false } },
+                            new Dictionary<string, object> { { "version", "4.0.0.0" }, { "summary", "修复已确认的驱动安全漏洞" }, { "sourceUrl", sources[0].Url }, { "quote", "Version 4.0.0.0 fixes CVE-2026-12345 security vulnerability." }, { "critical", true } },
+                            new Dictionary<string, object> { { "version", "5.0.0.0" }, { "summary", "模型虚构的驱动修复信息" }, { "sourceUrl", sources[0].Url }, { "quote", "invented undocumented fix" }, { "critical", true } }
+                        } } };
+                    };
+                    AiDriverTasks.Releases(repoRoot, repo, CancellationToken.None, delegate { });
+                    T(DriverReleasePolicies.Load(repoRoot).All(p => p.StableHash == older && p.LatestHash == newest), "verified web evidence selects older stable independently of latest");
+                    AiDriverTasks.News(repoRoot, repo, CancellationToken.None, delegate { });
+                    var notices = DriverNoticeStore.Items(repoRoot);
+                    T(notices.Count == 2, "only source-backed newer releases become notices");
+                    T(notices.Count(n => n.Critical) == 1 && notices.First(n => n.Version == "3.0.0.0").Critical == false, "normal fixes stay nonmodal; security fix is critical");
+                    AiDriverTasks.News(repoRoot, repo, CancellationToken.None, delegate { });
+                    T(DriverNoticeStore.Items(repoRoot).Count == 2, "persistent daily checkpoint prevents duplicate news");
+                    var notice = notices[0];
+                    T(!DriverNoticeStore.Add(repoRoot, notice), "same hardware and release deduplicates persistently");
+                    DriverNoticeStore.MarkRead(repoRoot, "admin-a", new[] { notice.Id });
+                    T(DriverNoticeStore.ReadIds(repoRoot, "admin-a").Contains(notice.Id), "read state persists");
+                    T(!DriverNoticeStore.ReadIds(repoRoot, "admin-b").Contains(notice.Id), "read state isolated per administrator");
+                    T(!DriverNewsReader.Allowed(new Uri("https://intel.com.evil.invalid/notes")), "official host suffix spoof rejected");
+                    T(!DriverNewsReader.Allowed(new Uri("http://intel.com/notes")), "insecure source rejected");
+                    T(DriverNewsReader.Allowed(new Uri("https://www.nvidia.com/notes")), "official vendor source allowed");
+                    T(AiDriverTasks.PublicVersion("32.0.15.7652", "NVIDIA") == "576.52", "NVIDIA public version maps from INF correctly");
+                    var normal = notices.First(n => !n.Critical);
+                    DriverNoticeStore.MarkRead(repoRoot, "admin-a", new[] { normal.Id });
+                    normal.Critical = true;
+                    T(DriverNoticeStore.Add(repoRoot, normal), "existing ordinary release can escalate to critical once");
+                    T(!DriverNoticeStore.ReadIds(repoRoot, "admin-a").Contains(normal.Id), "critical escalation is a new unread revision");
+                    T(!DriverNoticeStore.Add(repoRoot, normal), "critical escalation deduplicates across repeated checks");
+                    using (var env = StartEnv(repoRoot, "ai-token", null))
+                    {
+                        T(HttpGet(env.Url + "/api/admin/notices", null).Item1 == 401, "inbox requires admin authorization");
+                        T(HttpGet(env.Url + "/api/admin/notices", "ai-token").Item1 == 200, "authenticated inbox reads persisted notices");
+                        string html = HttpGet(env.Url + "/admin", null).Item2;
+                        T(html.Contains("driverInboxPanel") && html.Contains("noticeBadge"), "inbox and red unread badge rendered");
+                        T(!html.Contains("id='aiTimeout'") && !html.Contains("runAiTask('update')"), "advanced knobs and obsolete AI actions removed");
+                    }
+                    string manySource = Path.Combine(dir, "many-source"); Directory.CreateDirectory(manySource);
+                    for (int i = 0; i < 13; i++) WriteInf(manySource, "device" + i + ".inf", "PCI\\VEN_F121&DEV_" + i.ToString("D4"), "03/14/2026", "1.0.0.0", "NTamd64.10");
+                    string manyRoot = MakeRepo(Path.Combine(dir, "many-repo"), manySource);
+                    int searches = 0;
+                    DriverNewsReader.TestSearch = delegate { searches++; return sources; };
+                    using (var manyRepo = OfflineRepo.Open(manyRoot, _log))
+                    {
+                        AiDriverTasks.News(manyRoot, manyRepo, CancellationToken.None, delegate { });
+                        T(searches == 12, "news limits one batch without discarding remaining hardware");
+                        AiDriverTasks.News(manyRoot, manyRepo, CancellationToken.None, delegate { });
+                        T(searches == 13, "next batch resumes and covers hardware beyond the first twelve");
+                        AiDriverTasks.News(manyRoot, manyRepo, CancellationToken.None, delegate { });
+                        T(searches == 13, "completed hardware is not queried again before daily checkpoint expiry");
+                    }
+                }
+                finally { DriverNewsReader.TestSearch = null; AiDriverTasks.TestChat = null; }
+            }
+        }
+
+        private static void TestStartupRecovery(string root)
+        {
+            string dir = PrepareDir(Path.Combine(root, "startup-recovery"));
+            string src = Path.Combine(dir, "src"); Directory.CreateDirectory(src);
+            WriteInf(src, "dev.inf", "PCI\\VEN_F111&DEV_F111", "03/14/2026", "2.0.0.0", "NTamd64.10");
+            string repo = MakeRepo(Path.Combine(dir, "repo"), src);
+            int attempts = 0;
+            int port = GetFreePort();
+            using (var server = new LanDriverServer(new LanServerConfig { Port = port, Host = "localhost", RepoRoot = repo }, _log))
+            {
+                server.TestRepoOpenOverride = delegate(string path) {
+                    if (Interlocked.Increment(ref attempts) == 1) throw new IOException("simulated database unavailable at boot");
+                    return OfflineRepo.Open(path, _log);
+                };
+                server.Start();
+                string url = "http://localhost:" + port;
+                LanHealth h = null;
+                for (int i = 0; i < 100; i++) {
+                    h = new JavaScriptSerializer().Deserialize<LanHealth>(HttpGet(url + "/api/health", null).Item2);
+                    if (h.ImportStage == "failed") break;
+                    Thread.Sleep(50);
+                }
+                T(h != null && h.ImportStage == "failed" && !h.RepoLoaded, "initial failure is visible, not completed");
+                for (int i = 0; i < 300 && !server.RepoLoaded; i++) Thread.Sleep(50);
+                T(server.RepoLoaded, "repository recovers without service restart");
+                Thread.Sleep(1500);
+                T(attempts == 2, "healthy repository is not repeatedly reopened");
+                h = new JavaScriptSerializer().Deserialize<LanHealth>(HttpGet(url + "/api/health", null).Item2);
+                T(h.ImportStage == "completed", "load completes after recovery");
+                server.Stop();
+            }
+        }
+
         private static void TestRepoReloadKeepsOldRepo(string root)
         {
             string dir = PrepareDir(Path.Combine(root, "res-reload"));

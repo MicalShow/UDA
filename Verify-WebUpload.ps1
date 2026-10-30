@@ -1,4 +1,4 @@
-param([string]$OutputDirectory = 'web-console-stage1')
+﻿param([string]$OutputDirectory = 'web-console-stage1')
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Web.Extensions
 $assembly = [Reflection.Assembly]::LoadFrom((Join-Path $PSScriptRoot ($OutputDirectory + '\Lan\UDA-Server-Manager.exe')))

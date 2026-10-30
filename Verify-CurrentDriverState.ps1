@@ -1,4 +1,4 @@
-param([string]$OutputDirectory = 'release-v4.8.6')
+﻿param([string]$OutputDirectory = 'release-v4.8.6')
 $ErrorActionPreference = 'Stop'
 [void][Reflection.Assembly]::LoadFrom((Join-Path $PSScriptRoot ($OutputDirectory + '\Lan\UDA-Server-Manager.exe')))
 $device = New-Object UDA.D

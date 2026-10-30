@@ -1,4 +1,4 @@
-﻿// Produce a deterministic visual-QA artifact from the actual served HTML, without a real AI key/server.
+// Produce a deterministic visual-QA artifact from the actual served HTML, without a real AI key/server.
 const fs = require('fs');
 const html = fs.readFileSync(process.argv[2], 'utf8');
 const mock = `<script>

@@ -84,6 +84,7 @@ namespace UDA
                 // test — can never suppress installs or skip rounds inside this test.
                 string receiptFile = Path.Combine(root, "receipts-" + name + ".txt");
                 LanInstallReceiptStore.UseTestStore(receiptFile);
+                ClientTelemetryQueue.UseTestDirectory(Path.Combine(root, "test-telemetry-" + name));
                 try { body(); }
                 catch (Exception ex) { Fail("threw: " + ex.GetType().Name + ": " + ex.Message + " @ " + ex.StackTrace); }
                 finally { timer.Dispose(); LanInstallReceiptStore.ResetToProductStore(); }
@@ -95,6 +96,8 @@ namespace UDA
                 timedRun("LanGui.BusyRestoreInstallPath", () => TestBusyRestore());
                 timedRun("LanGui.MultiRoundInstallEntry", () => TestMultiRound());
                 timedRun("LanGui.SkippedCandidateRefresh", () => TestSkippedCandidateRefresh());
+                timedRun("LanGui.LiveOverviewHealth", () => TestLiveOverviewHealth());
+                timedRun("LanGui.VersionSelection", () => TestVersionSelection());
                 timedRun("LanGui.FirstScanRejectsRankedUpdate", () => TestFirstScanRejectsRankedUpdate(root));
                 timedRun("LanGui.ConfirmDeclinedNoBusy", () => TestDecline());
                 timedRun("LanGui.InstallFailureRestoresUi", () => TestFailure());
@@ -325,7 +328,7 @@ namespace UDA
                     new List<D> { Dev("PCI\\VEN_LGA&DEV_001", "GA", "oemA.inf", "2.0.0.0"), Dev("PCI\\VEN_LGB&DEV_001", "GB", "", "") },        // after round 0: A in effect, B still missing
                     new List<D> { Dev("PCI\\VEN_LGA&DEV_001", "GA", "oemA.inf", "2.0.0.0"), Dev("PCI\\VEN_LGB&DEV_001", "GB", "oemB.inf", "2.0.0.0") } // after round 1: all in effect
                 };
-                var client = NewClient(env.Url, Path.Combine(dir, "staging"), new MutatingCollector(snapshots), runner);
+                var client = NewClient(env.Url, Path.Combine(dir, "staging"), new MutatingCollector(snapshots.Skip(1).ToList()), runner);
                 var messages = new List<string>();
                 bool confirmed = false;
                 using (var form = NewForm())
@@ -392,6 +395,60 @@ namespace UDA
 
         // A scan candidate can be rejected by Windows as already current/best (pnputil 259).
         // Refresh hardware after skips so the stale update row is removed when the live version agrees.
+        private static void TestLiveOverviewHealth()
+        {
+            using (var form = NewForm())
+            {
+                var disabled = new D { Id = "disabled-bluetooth", Name = "Bluetooth", Error = 22 };
+                var missing = new D { Id = "audio", Name = "Audio", Error = 28 };
+                form.TestSetMachine(MachineOf(new List<D> { disabled, missing }));
+                T(form.TestOverviewProblems == "1", "disabled device is not counted as a driver fault");
+                form.TestMachineProvider = () => MachineOf(new List<D> { disabled, new D { Id = "audio", Name = "Audio", Error = 0, Inf = "oem-audio.inf", Version = "1.0" } });
+                PumpUntil(form.TestRefreshOverviewAsync());
+                T(form.TestOverviewProblems == "0" && form.TestOverviewHealth.Contains("良好"), "overview clears recovered Code 28 without rerunning driver installation");
+                form.TestMachineProvider = () => MachineOf(new List<D> { new D { Id = "audio", Error = 10 } });
+                PumpUntil(form.TestRefreshOverviewAsync());
+                T(form.TestOverviewProblems == "1", "real Code 10 remains abnormal even when repository offers no update");
+                T(!disabled.NeedsAttention && disabled.Bad, "display classification does not erase actual disabled state");
+            }
+        }
+
+        private static void TestVersionSelection()
+        {
+            using (var form = NewForm())
+            {
+                var old = new LanCandidateDto { DeviceInstanceId = "VERSIONS", ContentHash = new string('a', 64), InfRelativePath = "old.inf", DriverVerVersion = "1.0.0.0", ReleaseChannel = "稳定版", SignatureStatus = "trusted", Class = "Net" };
+                var latest = new LanCandidateDto { DeviceInstanceId = "VERSIONS", ContentHash = new string('b', 64), InfRelativePath = "new.inf", DriverVerVersion = "2.0.0.0", ReleaseChannel = "最新版", SignatureStatus = "trusted", Class = "Net", NeedInstall = true };
+                var defaultChoice = new JavaScriptSerializer().Deserialize<LanCandidateDto>(new JavaScriptSerializer().Serialize(old));
+                defaultChoice.Versions = new List<LanCandidateDto> { old, latest };
+                form.TestVersionReport(new LanReportResponse { Candidates = new List<LanCandidateDto> { defaultChoice } }, MachineOf(new List<D> { Dev("PCI\\VEN_TEST&DEV_5320", "VERSIONS", "current.inf", "1.0.0.0") }));
+                T(form.TestDriversGrid.Rows.Count == 1, "current stable device remains available for choosing another version");
+                T(!Convert.ToBoolean(form.TestDriversGrid.Rows[0].Cells[0].Value), "up-to-date stable version is not automatically selected for reinstall");
+                T(Convert.ToString(form.TestDriversGrid.Rows[0].Cells["ChooseVersion"].Value) == "1.0.0.0", "client row displays selected numeric version");
+                var selected = form.TestChooseVersion(0, 1);
+                T(selected.DriverVerVersion == "2.0.0.0" && selected.UserSelectedVersion && Convert.ToBoolean(form.TestDriversGrid.Rows[0].Cells[0].Value), "version choice updates displayed driver and installation selection");
+                T(!latest.UserSelectedVersion && !defaultChoice.UserSelectedVersion, "UI choice does not mutate cached server candidates");
+                T(Convert.ToString(form.TestDriversGrid.Rows[0].Cells["ChooseVersion"].Value) == "2.0.0.0", "version button follows user selection");
+                form.TestServerHealth(new LanHealth { RepoLoaded = true, ServerVersion = "server-test", RepositoryUpdatedUtc = "2026-10-29T10:00:00Z" });
+                T(form.TestReleaseStatus.Contains("server-test") && form.TestReleaseStatus.Contains("2026-10-29") && form.TestReleaseStatus.Contains(LanProtocol.ServerVersion), "footer displays client/server versions and repository date");
+                T(form.TestConnectionStatus == "已连接服务器" && !form.TestConnectionStatus.Contains("http"), "overview connection status hides server URL");
+                form.TestServerHealth(null);
+                T(form.TestConnectionStatus == "未连接服务器" && !form.TestReleaseStatus.Contains("server-test"), "disconnect clears stale server metadata");
+                T(form.TestChooseVersion(0, 0).DriverVerVersion == "1.0.0.0", "client can switch back to stable");
+                var extension = new LanCandidateDto { IsExtension = true, ExtensionId = Guid.NewGuid().ToString("B"), DeviceInstanceId = "VERSIONS", ContentHash = "EXTENSION", Class = "Extension", DriverVerVersion = "1.0.0.0", NeedInstall = true, FriendlyName = "音频配套扩展" };
+                form.TestVersionReport(new LanReportResponse { Candidates = new List<LanCandidateDto> { extension } }, MachineOf(new List<D> { Dev("PCI\\VEN_TEST&DEV_5320", "VERSIONS", "parent.inf", "100.0.0.0") }));
+                T(form.TestDriversGrid.Rows.Count == 1 && Convert.ToBoolean(form.TestDriversGrid.Rows[0].Cells[0].Value), "missing extension remains visible and selected despite newer parent version");
+                var missingReport = new LanReportResponse { UnmatchedDevices = new List<LanUnmatchedDeviceDto> { new LanUnmatchedDeviceDto { DeviceInstanceId = "VERSIONS", FriendlyName = "No repository package", ReasonCode = "NoMatchingDriver" } } };
+                form.TestVersionReport(missingReport, MachineOf(new List<D> { Dev("PCI\\VEN_TEST&DEV_5320", "VERSIONS", "current.inf", "1.0.0.0") }));
+                T(form.TestDriversGrid.Rows.Count == 1 && !form.TestDriversGrid.Rows[0].Visible, "unmatched devices are hidden by default");
+                form.TestShowHiddenDevices(true);
+                T(form.TestDriversGrid.Rows[0].Visible, "show hidden devices reveals unmatched rows");
+                form.TestShowHiddenDevices(false);
+                T(!form.TestDriversGrid.Rows[0].Visible, "turning off hidden devices restores filter");
+
+            }
+        }
+
         private static void TestSkippedCandidateRefresh()
         {
             string dir = PrepareDir(Path.Combine(Path.GetTempPath(), "uda-lan-gui-skipped-refresh"));

@@ -1,4 +1,4 @@
-﻿// Standalone, local-only database migration utility for the UDA server.
+// Standalone, local-only database migration utility for the UDA server.
 using System;
 using System.Collections.Generic;
 using System.Data.Common;

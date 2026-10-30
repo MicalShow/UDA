@@ -50,7 +50,7 @@ namespace UDA
                 Application.DoEvents();
                 var overflows = new List<string>();
                 FindOverflows(form, overflows);
-                using (var bitmap = new Bitmap(form.ClientSize.Width, form.ClientSize.Height))
+                using (var bitmap = new Bitmap(form.Width, form.Height))
                 {
                     form.DrawToBitmap(bitmap, new Rectangle(Point.Empty, bitmap.Size));
                     bitmap.Save(args[1], ImageFormat.Png);

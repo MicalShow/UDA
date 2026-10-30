@@ -1,4 +1,4 @@
-param([string]$OutputDirectory = "admin-auth-test")
+﻿param([string]$OutputDirectory = "admin-auth-test")
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $out = Join-Path $root $OutputDirectory

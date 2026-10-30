@@ -16,6 +16,12 @@ $generator=New-Object UDA.OfflineRepoGenerator((New-Object UDA.TrustingSignature
 [void][UDA.ServerStorage]::Migrate($Repository,$Connection)
 [UDA.ServerStorage]::RequireMigratedDatabase($Repository)
 Assert-Upgrade $true 'live MySQL dataset passes upgrade preflight'
+# Deployment AI configuration must stay local, including its machine-bound key.
+$aiConfig=New-Object UDA.AiSubscription
+$aiConfig.Name='upgrade-preservation';$aiConfig.BaseUrl='https://example.invalid/v1';$aiConfig.Model='test'
+[UDA.AiSubscriptionStore]::Save($Repository,$aiConfig,'UDA-UPGRADE-TEST-KEY')
+$aiConfigPath=Join-Path $Repository 'ai-subscription.json'
+$aiConfigOriginal=[IO.File]::ReadAllText($aiConfigPath)
 # Simulate the incomplete migration produced by an older service.
 $missed=Join-Path $Repository 'ai-preflight.json'
 [IO.File]::WriteAllText($missed,'{"result":"补迁测试"}')
@@ -58,6 +64,91 @@ try{
  Assert-Upgrade ($failed -and (Test-Path -LiteralPath (Join-Path $Repository 'packages')) -and -not ([UDA.ServerStorage]::Config($Repository)).DatabaseOnly) 'corrupt driver ZIP blocks cleanup and preserves raw drivers'
 }finally{[IO.File]::Copy($backup,$archive,$true)}
 $reclaimed=[UDA.DatabaseArchiveRepository]::Compact($Repository)
+Assert-Upgrade ((Test-Path -LiteralPath $aiConfigPath) -and [IO.File]::ReadAllText($aiConfigPath)-eq $aiConfigOriginal) 'database activation preserves local AI configuration and encrypted key byte-for-byte'
+Assert-Upgrade (([UDA.ServerStorage]::Documents($Repository,'repo.ai-subscription.json')).Count-eq 0) 'AI deployment configuration is not imported as business data'
+[UDA.ServerStorage]::ActivateDatabaseOnly($Repository)
+Assert-Upgrade ([IO.File]::ReadAllText($aiConfigPath)-eq $aiConfigOriginal) 'repeat database-only upgrade accepts local AI configuration without requiring a SQL shadow row'
+# Actual SQL-backed independent AI workers and durable restart recovery.
+Add-Type -TypeDefinition 'using System; using System.Threading; public static class UdaSqlAiWorker { public static string Run(string kind, CancellationToken token, Action<string> progress) { progress("SQL lifecycle worker started"); while(true){token.ThrowIfCancellationRequested();progress("SQL lifecycle checkpoint");Thread.Sleep(20);} } }'
+$aiRunner=New-Object UDA.AiDriverTaskRunner($Repository,[Func[UDA.OfflineRepo]]{return $null},[Threading.CancellationToken]::None)
+$aiField=$aiRunner.GetType().GetField('TestRun',[Reflection.BindingFlags]'Instance,NonPublic')
+$aiField.SetValue($aiRunner,[Delegate]::CreateDelegate($aiField.FieldType,[UdaSqlAiWorker].GetMethod('Run')))
+try {
+ Assert-Upgrade ($aiRunner.Begin('releases',$false) -and $aiRunner.Begin('news',$false)) 'SQL-backed AI jobs run independently'
+ $aiStatusJson=New-Object Web.Script.Serialization.JavaScriptSerializer
+ $aiStatus=$aiStatusJson.DeserializeObject($aiStatusJson.Serialize($aiRunner.Status()))
+ foreach($task in $aiStatus['tasks']){[void]$aiRunner.Control($task['id'],'cancel')}
+ for($i=0;$i-lt 300 -and $aiRunner.IsRunning;$i++){Start-Sleep -Milliseconds 10}
+ Assert-Upgrade (-not $aiRunner.IsRunning) 'SQL-backed cancelled jobs release active status'
+} finally {$aiRunner.Dispose()}
+for($aiWait=0;$aiWait-lt 300;$aiWait++){
+ $aiRows=[UDA.ServerStorage]::Documents($Repository,'repo.ai-task.')
+ if($aiRows.Count-eq 2){break}
+ Start-Sleep -Milliseconds 20
+}
+Assert-Upgrade ($aiRows.Count-eq 2 -and -not (Get-ChildItem -LiteralPath $Repository -Filter 'repo.ai-task.*.json')) 'AI task progress and logs persist in MySQL without local business files'
+$interruptedAiId=[Guid]::NewGuid().ToString('N')
+[UDA.ServerStorage]::Write($Repository,('repo.ai-task.'+$interruptedAiId+'.json'),('{"id":"'+$interruptedAiId+'","action":"news","state":"running","startedUtc":"'+[DateTime]::UtcNow.ToString('o')+'"}'),$false)
+$aiRecovered=New-Object UDA.AiDriverTaskRunner($Repository,[Func[UDA.OfflineRepo]]{return $null},[Threading.CancellationToken]::None)
+try {$aiRecovered.Start();Assert-Upgrade (-not $aiRecovered.IsRunning -and $aiStatusJson.Serialize($aiRecovered.Status()).Contains('interrupted')) 'SQL task recovery marks stale running records interrupted after restart'} finally {$aiRecovered.Dispose()}
+$autoRunner=New-Object UDA.AiDriverTaskRunner($Repository,[Func[UDA.OfflineRepo]]{return $null},[Threading.CancellationToken]::None)
+try {
+ $planEnvelope=$aiStatusJson.DeserializeObject($aiStatusJson.Serialize($autoRunner.ScheduleStatus()))
+ $autoPlan=$aiStatusJson.Deserialize($aiStatusJson.Serialize($planEnvelope['settings']),[UDA.AiAutoTaskSettings])
+ $autoPlan.enabled=$false;$autoPlan.tasksEnabled=$false;$autoPlan.news.frequency='weekly';$autoPlan.news.time='22:15';$autoPlan.news.weekDay=5
+ $autoPlan.news.deviceTypes=New-Object 'Collections.Generic.List[string]';$autoPlan.news.deviceTypes.Add('display')
+ $autoRunner.SaveSchedule($autoPlan)
+ Assert-Upgrade (-not (Test-Path -LiteralPath (Join-Path $Repository 'repo.ai-auto-schedule.json')) -and ([UDA.ServerStorage]::Documents($Repository,'repo.ai-auto-schedule.json')).Count-eq 1) 'automatic task plan and device scope live only in MySQL'
+} finally {$autoRunner.Dispose()}
+$autoRestart=New-Object UDA.AiDriverTaskRunner($Repository,[Func[UDA.OfflineRepo]]{return $null},[Threading.CancellationToken]::None)
+try {
+ $reloaded=$aiStatusJson.DeserializeObject($aiStatusJson.Serialize($autoRestart.ScheduleStatus()))
+ Assert-Upgrade (-not $reloaded['settings']['enabled'] -and -not $reloaded['settings']['tasksEnabled'] -and $reloaded['settings']['news']['time']-eq '22:15' -and $reloaded['settings']['news']['deviceTypes'][0]-eq 'display') 'restart restores disabled automatic plan, execution time and chosen device types from SQL'
+} finally {$autoRestart.Dispose()}
+$historyEvent=New-Object UDA.DriverInstallEvent;$historyEvent.EventId=[Guid]::NewGuid().ToString('N');$historyEvent.RunId=[Guid]::NewGuid().ToString('N');$historyEvent.Machine='Historical-Lab-PC';$historyEvent.Status='log';$historyEvent.Detail='Preserved synthetic historical run';$historyEvent.Utc='2026-10-01T01:00:00Z';$historyEvent.CountInUsage=$false;$historyEvent.RecoverySource='Legacy imported log';$historyEvent.MachineId=('c'*64)
+$historyBatch=New-Object 'Collections.Generic.List[UDA.DriverInstallEvent]';$historyBatch.Add($historyEvent)
+$pageIndexType=[UDA.ServerStorage].Assembly.GetType('UDA.InstallLogPages')
+$pageIndex=[Activator]::CreateInstance($pageIndexType,[object[]]@($Repository))
+$readPages=$pageIndexType.GetMethod('Read')
+$beforeIndex=$readPages.Invoke($pageIndex,[object[]]@($false))
+$beforeCount=$beforeIndex.GetType().GetField('EventCount').GetValue($beforeIndex)
+$firstHistory=[UDA.ServerStorage]::ImportHistoricalEvents($Repository,$historyBatch)
+$repeatHistory=[UDA.ServerStorage]::ImportHistoricalEvents($Repository,$historyBatch)
+Assert-Upgrade ($firstHistory[0]-eq 1 -and $repeatHistory[1]-eq 1 -and -not (Test-Path -LiteralPath (Join-Path $Repository ('install-events\'+$historyEvent.EventId+'.json')))) 'historical recovery is SQL-only, transactional and idempotent'
+Assert-Upgrade (([UDA.ServerStorage]::Events($Repository) | Where-Object {$_ -like '*Historical-Lab-PC*'}).Count-eq 1) 'original historical run is retained once with original time'
+$afterIndex=$readPages.Invoke($pageIndex,[object[]]@($false))
+$fullReads=$pageIndexType.GetField('FullReads',[Reflection.BindingFlags]'NonPublic,Instance').GetValue($pageIndex)
+Assert-Upgrade ($fullReads-eq 1 -and $afterIndex.GetType().GetField('EventCount').GetValue($afterIndex)-eq $beforeCount+1) 'SQL historical commit updates warm page directory incrementally without rereading all bodies'
+$detail=$afterIndex.GetType().GetMethod('Details').Invoke($afterIndex,[object[]]@($Repository,$historyEvent.RunId,'',0,100))
+Assert-Upgrade ($aiStatusJson.Serialize($detail).Contains('Preserved synthetic historical run')) 'full session body loads from MySQL by event keys after metadata-only paging'
+$beforeMachines=$beforeIndex.GetType().GetField('Machines').GetValue($beforeIndex)
+$afterMachines=$afterIndex.GetType().GetField('Machines').GetValue($afterIndex)
+Assert-Upgrade ($afterMachines-eq $beforeMachines+1) 'legacy recovered runtime log counts its machine despite the old false usage flag'
+$priorHardware=$afterIndex.GetType().GetField('Hardware').GetValue($afterIndex)
+$priorUpdates=$afterIndex.GetType().GetField('Updates').GetValue($afterIndex)
+$successHistory=New-Object UDA.DriverInstallEvent
+$successHistory.EventId=[Guid]::NewGuid().ToString('N');$successHistory.RunId=[Guid]::NewGuid().ToString('N');$successHistory.Machine=$historyEvent.Machine;$successHistory.MachineId=$historyEvent.MachineId
+$successHistory.Status='updated';$successHistory.Device='HISTORICAL-NIC';$successHistory.CountInUsage=$false;$successHistory.RecoverySource='Legacy imported success';$successHistory.Utc=$historyEvent.Utc
+[UDA.ServerStorage]::Write($Repository,('install-events/'+$successHistory.EventId+'.json'),$aiStatusJson.Serialize($successHistory),$true)
+$counted=$readPages.Invoke($pageIndex,[object[]]@($false))
+Assert-Upgrade ($counted.GetType().GetField('Machines').GetValue($counted)-eq $afterMachines -and $counted.GetType().GetField('Hardware').GetValue($counted)-eq $priorHardware+1 -and $counted.GetType().GetField('Updates').GetValue($counted)-eq $priorUpdates+1) 'legacy successful update participates in SQL-backed device/driver usage with machine deduplication'
+$nextHistory=New-Object UDA.DriverInstallEvent
+$nextHistory.EventId=[Guid]::NewGuid().ToString('N');$nextHistory.RunId=[Guid]::NewGuid().ToString('N');$nextHistory.Machine=$successHistory.Machine;$nextHistory.MachineId=$successHistory.MachineId;$nextHistory.Device=$successHistory.Device
+$nextHistory.Status='updated';$nextHistory.RecoverySource=$successHistory.RecoverySource;$nextHistory.CountInUsage=$false;$nextHistory.Utc='2026-10-28T10:00:00Z'
+[UDA.ServerStorage]::Write($Repository,('install-events/'+$nextHistory.EventId+'.json'),$aiStatusJson.Serialize($nextHistory),$true)
+$twice=$readPages.Invoke($pageIndex,[object[]]@($false))
+Assert-Upgrade ($twice.GetType().GetField('Machines').GetValue($twice)-eq $afterMachines -and $twice.GetType().GetField('Hardware').GetValue($twice)-eq $priorHardware+2 -and $twice.GetType().GetField('Updates').GetValue($twice)-eq $priorUpdates+2) 'same SQL-backed machine/device updated in two tasks counts two operations with one physical computer'
+$nextHistory.EventId=[Guid]::NewGuid().ToString('N')
+[UDA.ServerStorage]::Write($Repository,('install-events/'+$nextHistory.EventId+'.json'),$aiStatusJson.Serialize($nextHistory),$true)
+$repeated=$readPages.Invoke($pageIndex,[object[]]@($false))
+Assert-Upgrade ($repeated.GetType().GetField('Hardware').GetValue($repeated)-eq $priorHardware+2 -and $repeated.GetType().GetField('Updates').GetValue($repeated)-eq $priorUpdates+2) 'repeated success fragments within the same SQL-backed task remain deduplicated'
+
+
+
+
+
+
+
 Assert-Upgrade ($reclaimed -gt 0 -and -not (Test-Path -LiteralPath (Join-Path $Repository 'packages'))) 'verified driver archives replace raw packages and reclaim space'
 Assert-Upgrade (-not (Test-Path -LiteralPath (Join-Path $Repository 'repo.manifest.json')) -and -not (Test-Path -LiteralPath (Join-Path $Repository 'repo.udadb'))) 'catalog and binary hardware index no longer remain as persistent local copies'
 Assert-Upgrade (([UDA.ServerStorage]::Config($Repository)).DatabaseOnly -and $null-ne [UDA.ServerStorage]::Read($Repository,'repo.index-state.json')) 'SQL contains hardware index blocks and database-only state'
@@ -123,6 +214,7 @@ try{
 $listener=New-Object Net.Sockets.TcpListener([Net.IPAddress]::Loopback,0);$listener.Start();$port=$listener.LocalEndpoint.Port;$listener.Stop()
 $cfg=New-Object UDA.LanServerConfig;$cfg.RepoRoot=$Repository;$cfg.Host='localhost';$cfg.Port=$port;$cfg.AdminCredentialsFile=Join-Path $WorkDirectory 'test-admin.json'
 $server=New-Object UDA.LanDriverServer($cfg,$null)
+[UDA.LanDriverServer].GetField('TestWatchDebounceMs',[Reflection.BindingFlags]'Instance,NonPublic').SetValue($server,600000)
 function Report-Model($model,$build){
  $report=New-Object UDA.LanReportRequest;$report.RequestId=[Guid]::NewGuid().ToString('N');$report.MachineManufacturer='Test Maker';$report.MachineModel=$model;$report.OsArchitecture='amd64';$report.OsMajorVersion=10;$report.OsBuildNumber=$build
  $device=New-Object UDA.LanDeviceDto;$device.DeviceInstanceId='TEST-DEVICE';$device.HardwareIds.Add('PCI\VEN_FFFF&DEV_F001');$report.Devices.Add($device)
@@ -131,7 +223,27 @@ function Report-Model($model,$build){
  try{$reader=New-Object IO.StreamReader($response.GetResponseStream());return @{Status=[int]$response.StatusCode;Data=$serializer.DeserializeObject($reader.ReadToEnd())}}finally{$response.Dispose()}
 }
 try{
- $server.Start();for($i=0;$i-lt 100 -and -not $server.RepoLoaded;$i++){Start-Sleep -Milliseconds 100}
+ # Emulate a reboot where SQL is temporarily unreachable, with no local manifest fallback.
+ [IO.File]::WriteAllText($storageFile,$serializer.Serialize($broken))
+ try {
+  $server.Start()
+  $startupHealth=$null
+  for($i=0;$i-lt 100;$i++){
+   $startupHealth=Invoke-RestMethod ('http://localhost:'+$port+'/api/health')
+   if($startupHealth.ImportStage-eq 'failed'){break}
+   Start-Sleep -Milliseconds 100
+  }
+  Assert-Upgrade (-not $startupHealth.RepoLoaded -and $startupHealth.ImportStage-eq 'failed' -and $startupHealth.RepoRetryUtc) 'SQL-only startup outage is reported as failed and schedules automatic recovery'
+ } finally { [IO.File]::WriteAllText($storageFile,$original) }
+ for($i=0;$i-lt 300 -and -not $server.RepoLoaded;$i++){Start-Sleep -Milliseconds 100}
+ Assert-Upgrade $server.RepoLoaded 'restoring SQL connectivity automatically loads the repository without restarting the service'
+ $notice=New-Object UDA.DriverNotice;$notice.Hardware='Synthetic SQL Hardware 4070';$notice.Version='580.00';$notice.Title='Synthetic driver security fix';$notice.Detail='Synthetic fixture';$notice.Critical=$true;$notice.SourceUrl='https://www.nvidia.com/';$notice.Evidence='Synthetic evidence'
+ [void][UDA.DriverNoticeStore]::Add($Repository,$notice)
+ [void][UDA.DriverNoticeStore]::Add($Repository,$notice)
+ $sqlNotices=[UDA.DriverNoticeStore]::Items($Repository)
+ Assert-Upgrade ($sqlNotices.Count-eq 1 -and $sqlNotices[0].Critical -and -not (Test-Path -LiteralPath (Join-Path $Repository ('repo.driver-notice.'+$notice.Id+'.json')))) 'driver notices are deduplicated and stored in MySQL without local business files'
+ [UDA.DriverNoticeStore]::MarkRead($Repository,'admin-a',[string[]]@($notice.Id))
+ Assert-Upgrade ([UDA.DriverNoticeStore]::ReadIds($Repository,'admin-a').Contains($notice.Id) -and -not [UDA.DriverNoticeStore]::ReadIds($Repository,'admin-b').Contains($notice.Id)) 'MySQL persists independent administrator read receipts'
  $specific=Report-Model 'Model A' 19045
  Assert-Upgrade ($specific.Status-eq 200 -and $specific.Data.Candidates.Count-eq 1 -and $specific.Data.Candidates[0].DriverVerVersion-eq '1.0.0.0' -and $specific.Data.Candidates[0].PackageId.StartsWith('model-')) 'specific model uses its approved older package instead of newer generic drivers'
  $general=Report-Model 'Unknown Model' 19045
@@ -140,9 +252,10 @@ try{
  Assert-Upgrade ($unsupported.Status-eq 200 -and $unsupported.Data.Candidates[0].DriverVerVersion-eq '99.0.0.0' -and $unsupported.Data.Candidates[0].PackageId-eq '') 'model without requested OS package uses generic drivers through actual report API'
  $cookies=New-Object Net.CookieContainer
  function Upload-Request($path,$body,$method='POST'){
-  $request=[Net.HttpWebRequest]::Create('http://localhost:'+$port+$path);$request.Proxy=$null;$request.CookieContainer=$cookies;$request.Method=$method;$request.Headers['X-UDA-Protocol']=if($path-eq '/api/admin/drivers/delete' -or $path.StartsWith('/api/admin/import?')){[string][UDA.LanProtocol]::Version}else{'1'}
+  $request=[Net.HttpWebRequest]::Create('http://localhost:'+$port+$path);$request.Proxy=$null;$request.CookieContainer=$cookies;$request.Method=$method;$request.Headers['X-UDA-Protocol']=if($path-eq '/api/admin/drivers/delete' -or $path-eq '/api/admin/organize' -or $path-eq '/api/admin/dedupe' -or $path.StartsWith('/api/admin/import?')){[string][UDA.LanProtocol]::Version}else{'1'}
   if($null-ne $body){$bytes=[Text.Encoding]::UTF8.GetBytes($body);$request.ContentType='application/json';$request.ContentLength=$bytes.Length;$stream=$request.GetRequestStream();$stream.Write($bytes,0,$bytes.Length);$stream.Dispose()}
-  $response=$request.GetResponse();try{$reader=New-Object IO.StreamReader($response.GetResponseStream());return $serializer.DeserializeObject($reader.ReadToEnd())}finally{$response.Dispose()}
+  try{$response=$request.GetResponse()}catch [Net.WebException]{if($_.Exception.Response){$failureResponse=$_.Exception.Response;try{$failureReader=New-Object IO.StreamReader($failureResponse.GetResponseStream());throw ($path+': '+$failureReader.ReadToEnd())}finally{$failureResponse.Dispose()}};throw}
+  try{$reader=New-Object IO.StreamReader($response.GetResponseStream());return $serializer.DeserializeObject($reader.ReadToEnd())}finally{$response.Dispose()}
  }
  [void](Upload-Request '/api/admin/login' '{"user":"tls-admin","password":"Isolated-Admin-Password-123!"}')
  $modelEditor=Upload-Request '/api/admin/machine-packages' $null 'GET'
@@ -229,6 +342,97 @@ try{
  $duplicateChanged=@($afterChecks.Keys | Where-Object {$duplicateChecks[$_].VerifiedUtc-ne $afterChecks[$_].VerifiedUtc})
  Assert-Upgrade ($duplicateStatus.addedInfCount-eq 0 -and $duplicateChanged.Count-eq 0) 'duplicate source append neither copies archived packages nor repeats archive content verification'
  foreach($policyItem in [UDA.MachineDriverPackages]::Load($Repository)){$modelPath=[UDA.MachineDriverPackages]::Archive($Repository,$policyItem.SourceName,$policyItem.PackagePrefix,$false);Assert-Upgrade ($oldModels.ContainsKey($modelPath)) 'model package identity depends on scoped content rather than whole catalog revision'}
+ # Active workspaces are preserved; an interrupted workspace is recovered without touching live data.
+ $recoveryCatalog=[UDA.ServerStorage]::Read($Repository,'repo.manifest.json')
+ $orphan=New-Object UDA.ServerStorage+OnlineWorkspace($Repository)
+ try{
+  $recoverMethod=[UDA.ServerStorage].GetMethod('RecoverOnlineWorkspaces',[Reflection.BindingFlags]'NonPublic,Static')
+  $recoverMethod.Invoke($null,@($Repository))
+  Assert-Upgrade (Test-Path -LiteralPath $orphan.Root) 'startup recovery preserves a workspace owned by a running process'
+  $ownerPath=Join-Path $orphan.Root '.owner.json';$owner=$serializer.DeserializeObject([IO.File]::ReadAllText($ownerPath));$owner['pid']=[string][int]::MaxValue
+  [IO.File]::WriteAllText($ownerPath,$serializer.Serialize($owner))
+  $recoverMethod.Invoke($null,@($Repository))
+  Assert-Upgrade (-not (Test-Path -LiteralPath $orphan.Root) -and [UDA.ServerStorage]::Read($Repository,'repo.manifest.json')-eq $recoveryCatalog) 'startup recovery removes an interrupted private workspace and preserves the published catalog'
+ }finally{$orphan.Dispose()}
+ # Deterministically pause the real background worker just before publication.
+ Add-Type -TypeDefinition @"
+using System; using System.Threading;
+public sealed class UdaOnlineMaintenanceGate {
+ public readonly ManualResetEvent Entered = new ManualResetEvent(false), Release = new ManualResetEvent(false);
+ public bool Fail;
+ public Action Callback { get { return Hold; } }
+ private void Hold() { Entered.Set(); if(!Release.WaitOne(20000))throw new TimeoutException("test publication gate"); if(Fail)throw new InvalidOperationException("injected failure before publication"); }
+}
+"@
+ $hook=[UDA.LanDriverServer].GetField('TestOnlineBeforeCommit',[Reflection.BindingFlags]'Instance,NonPublic')
+ function Download-CandidateHash($candidate){
+  $url='http://localhost:'+$port+'/api/download?path='+[Uri]::EscapeDataString($candidate.InfRelativePath)
+  if($candidate.PackageId){$url+='&package='+[Uri]::EscapeDataString($candidate.PackageId)}
+  $request=[Net.HttpWebRequest]::Create($url);$request.Proxy=$null;$request.Timeout=5000;$request.Headers['X-UDA-Protocol']=[string][UDA.LanProtocol]::Version
+  $response=$request.GetResponse();try{$hash=[Security.Cryptography.SHA256]::Create();try{return [Convert]::ToBase64String($hash.ComputeHash($response.GetResponseStream()))}finally{$hash.Dispose()}}finally{$response.Dispose()}
+ }
+ $maintSource=Join-Path $WorkDirectory 'online-input';[void][IO.Directory]::CreateDirectory($maintSource)
+ $maintInf=([IO.File]::ReadAllText((Join-Path $Source 'tls-test.inf'))).Replace('DEV_F001','DEV_F100').Replace('1.0.0.0','5.0.0.0')
+ [IO.File]::WriteAllText((Join-Path $maintSource 'one.inf'),$maintInf);[IO.File]::WriteAllText((Join-Path $maintSource 'duplicate.inf'),$maintInf)
+ $payload=New-Object byte[] (16*1024*1024);$rng=[Security.Cryptography.RandomNumberGenerator]::Create();try{$rng.GetBytes($payload)}finally{$rng.Dispose()};[IO.File]::WriteAllBytes((Join-Path $maintSource 'payload.bin'),$payload);$payload=$null
+ foreach($operation in @('append','update-version','organize','dedupe','failed-append')){
+  foreach($watcher in [UDA.LanDriverServer].GetField('_sourceWatchers',[Reflection.BindingFlags]'Instance,NonPublic').GetValue($server)){$watcher.EnableRaisingEvents=$false}
+  $beforeCatalog=[UDA.ServerStorage]::Read($Repository,'repo.manifest.json')
+  $candidateA=(Report-Model 'Model A' 19045).Data.Candidates[0]
+  $candidateB=(Report-Model 'Unknown Model' 19045).Data.Candidates[0]
+  $oldEntry=([UDA.OfflineRepoGenerator]::TryLoadManifest($Repository)).Entries | Where-Object {$_.HardwareIds-contains 'PCI\VEN_FFFF&DEV_F099' -and $_.DriverVerVersion-eq '4.0.0.0'} | Select-Object -First 1
+  $candidateC=@{InfRelativePath=$oldEntry.RelativePath;PackageId=''}
+  $beforeA=Download-CandidateHash $candidateA;$beforeB=Download-CandidateHash $candidateB;$beforeC=Download-CandidateHash $candidateC
+  if($operation-eq 'organize'){$preOrganizationGeneric=$candidateB}
+  $gate=New-Object UdaOnlineMaintenanceGate;$gate.Fail=($operation-eq 'failed-append');$hook.SetValue($server,$gate.Callback)
+  try{
+   if($operation-eq 'append' -or $operation-eq 'update-version' -or $operation-eq 'failed-append'){
+    if($operation-eq 'update-version'){$changedInf=$maintInf.Replace('DEV_F100','DEV_F099').Replace('5.0.0.0','6.0.0.0');[IO.File]::WriteAllText((Join-Path $maintSource 'one.inf'),$changedInf);[IO.File]::WriteAllText((Join-Path $maintSource 'duplicate.inf'),$changedInf)}
+    if($operation-eq 'failed-append'){[IO.File]::WriteAllText((Join-Path $maintSource 'one.inf'),$maintInf.Replace('DEV_F100','DEV_F101'))}
+    [void](Upload-Request ('/api/admin/import?src='+[Uri]::EscapeDataString($maintSource)) '{}')
+   }else{[void](Upload-Request ('/api/admin/'+$operation) '{}')}
+   if(-not $gate.Entered.WaitOne(20000)){$failedStatus=Upload-Request '/api/admin/import-status' $null 'GET';throw ($operation+': '+$serializer.Serialize($failedStatus))}
+   Assert-Upgrade $true ($operation+': actual worker reaches isolated publication checkpoint')
+   Assert-Upgrade ([UDA.ServerStorage]::Read($Repository,'repo.manifest.json')-eq $beforeCatalog) ($operation+': unfinished workspace does not alter the published SQL catalog')
+   $during=Upload-Request '/api/health' $null 'GET'
+   Assert-Upgrade ($during.RepoLoaded -and -not $during.ImportRunning) ($operation+': ready clients are not told to pause for maintenance')
+   for($probe=0;$probe-lt 3;$probe++){
+    $scanA=Report-Model 'Model A' 19045;$scanB=Report-Model 'Unknown Model' 19045
+    Assert-Upgrade ($scanA.Status-eq 200 -and $scanB.Status-eq 200) ($operation+': model and generic client scans continue during maintenance')
+    Assert-Upgrade ((Download-CandidateHash $candidateA)-eq $beforeA -and (Download-CandidateHash $candidateB)-eq $beforeB -and (Download-CandidateHash $candidateC)-eq $beforeC) ($operation+': existing model, generic and older hardware-version archives remain byte-identical and downloadable')
+   }
+   $heldResponse=$null
+   if($operation-eq 'update-version'){
+    $large=([UDA.OfflineRepoGenerator]::TryLoadManifest($Repository)).Entries | Where-Object {$_.HardwareIds-contains 'PCI\VEN_FFFF&DEV_F100'} | Select-Object -First 1
+    $largeRequest=[Net.HttpWebRequest]::Create('http://localhost:'+$port+'/api/download?path='+[Uri]::EscapeDataString($large.RelativePath));$largeRequest.Proxy=$null;$largeRequest.Timeout=5000;$largeRequest.ReadWriteTimeout=10000;$largeRequest.Headers['X-UDA-Protocol']=[string][UDA.LanProtocol]::Version
+    $heldResponse=$largeRequest.GetResponse();$heldStream=$heldResponse.GetResponseStream();$firstByte=$heldStream.ReadByte()
+   }
+  }finally{[void]$gate.Release.Set();$hook.SetValue($server,$null)}
+  if($operation-ne 'failed-append'){
+   $completedMaintenance=Wait-Append
+   if($operation-eq 'dedupe'){Assert-Upgrade ($completedMaintenance.duplicateInfCount-gt 0) 'online dedupe removes actual duplicate entries while preserving independent model packages'}
+   if($heldResponse){
+    try{$remaining=New-Object IO.MemoryStream;$heldStream.CopyTo($remaining);Assert-Upgrade ($firstByte-ge 0 -and $remaining.Length-gt 8MB) 'a real in-flight 16MiB ZIP completes across the atomic metadata switch'}finally{$heldResponse.Dispose();if($remaining){$remaining.Dispose()}}
+   }
+   Assert-Upgrade ((Download-CandidateHash $candidateA)-eq $beforeA -and (Download-CandidateHash $candidateB)-eq $beforeB -and (Download-CandidateHash $candidateC)-eq $beforeC) ($operation+': pre-maintenance scan results still download after the atomic switch')
+  }else{
+   for($spin=0;$spin-lt 100;$spin++){$failure=Upload-Request '/api/admin/import-status' $null 'GET';if(-not $failure.running){break};Start-Sleep -Milliseconds 50}
+   Assert-Upgrade ($failure.stage-eq 'failed' -and [UDA.ServerStorage]::Read($Repository,'repo.manifest.json')-eq $beforeCatalog) ('failed workspace is discarded without changing the live catalog: '+$serializer.Serialize($failure))
+   Assert-Upgrade ((Download-CandidateHash $candidateA)-eq $beforeA -and (Download-CandidateHash $candidateB)-eq $beforeB -and (Download-CandidateHash $candidateC)-eq $beforeC) 'failed workspace leaves previous client installations usable'
+  }
+ }
+ Assert-Upgrade (([UDA.ServerStorage]::Documents($Repository,'repo.download-history.')).Count-gt 0) 'previous download tickets persist in MySQL for client continuity after restart'
+ # Recreate the HTTP service to exercise SQL-backed ticket recovery, not just an in-memory cache.
+ $server.Stop();$server.Dispose();$server=New-Object UDA.LanDriverServer($cfg,$null)
+ [UDA.LanDriverServer].GetField('TestWatchDebounceMs',[Reflection.BindingFlags]'Instance,NonPublic').SetValue($server,600000)
+ $server.Start()
+ for($spin=0;$spin-lt 100 -and -not $server.RepoLoaded;$spin++){Start-Sleep -Milliseconds 50}
+ Assert-Upgrade ((Download-CandidateHash $candidateA)-eq $beforeA -and (Download-CandidateHash $candidateB)-eq $beforeB -and (Download-CandidateHash $candidateC)-eq $beforeC) 'pre-switch download tickets remain usable after server restart'
+ $startupRunning=[UDA.LanDriverServer].GetProperty('ImportRunningNow',[Reflection.BindingFlags]'Instance,NonPublic')
+ for($spin=0;$spin-lt 100 -and $startupRunning.GetValue($server,$null);$spin++){Start-Sleep -Milliseconds 50}
+ foreach($watcher in [UDA.LanDriverServer].GetField('_sourceWatchers',[Reflection.BindingFlags]'Instance,NonPublic').GetValue($server)){$watcher.EnableRaisingEvents=$false}
+ $cookies=New-Object Net.CookieContainer
+ [void](Upload-Request '/api/admin/login' '{"user":"tls-admin","password":"Isolated-Admin-Password-123!"}')
  # Catalog deletion must neither expand nor rewrite any archive, including unrelated ones.
  $beforeDelete=[UDA.OfflineRepoGenerator]::TryLoadManifest($Repository)
  $victim=@($beforeDelete.Entries | Where-Object {$_.SourceName -eq 'generic'})
@@ -266,6 +470,9 @@ try{
  Assert-Upgrade ($changed.Count-eq 0) 'delete does not modify or recompress any archive'
  $stillServing=Report-Model 'Imported Model' 26100
  Assert-Upgrade ($stillServing.Status-eq 200 -and $stillServing.Data.Candidates.Count-gt 0) 'unrelated model report remains usable immediately after deletion'
+ $deletedBlocked=$false
+ try{[void](Download-CandidateHash $preOrganizationGeneric)}catch [Net.WebException]{if($_.Exception.Response){$deletedBlocked=([int]$_.Exception.Response.StatusCode-eq 404);$_.Exception.Response.Dispose()}else{throw}}
+ Assert-Upgrade $deletedBlocked 'explicit unpublish cannot be bypassed through an older pre-organization download ticket'
  $server.LoadRepo()
  $reloaded=Report-Model 'Imported Model' 26100
  Assert-Upgrade ($reloaded.Status-eq 200 -and $reloaded.Data.Candidates.Count-gt 0) 'catalog-only deletion survives repository reload'

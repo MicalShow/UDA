@@ -1,4 +1,4 @@
-<# .SYNOPSIS 验证已存在连接优先复用，避免 Windows 1219 凭据冲突。 #>
+﻿<# .SYNOPSIS 验证已存在连接优先复用，避免 Windows 1219 凭据冲突。 #>
 [CmdletBinding()]param([string]$OutputDirectory)
 Set-StrictMode -Version 2.0;$ErrorActionPreference='Stop';$root=Split-Path -Parent $MyInvocation.MyCommand.Path
 if([string]::IsNullOrWhiteSpace($OutputDirectory)){$OutputDirectory=Join-Path $root 'network-test-results'}

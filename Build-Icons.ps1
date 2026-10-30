@@ -1,4 +1,4 @@
-param([string]$OutputDirectory = (Join-Path $PSScriptRoot 'Assets'))
+﻿param([string]$OutputDirectory = (Join-Path $PSScriptRoot 'Assets'))
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Drawing
 [void][IO.Directory]::CreateDirectory($OutputDirectory)

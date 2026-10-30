@@ -1,4 +1,4 @@
-﻿// ServerSetup.cs - elevated, dependency-free Windows installer for the LAN server.
+// ServerSetup.cs - elevated, dependency-free Windows installer for the LAN server.
 using System;
 using System.Collections.Generic;
 using System.Globalization;
@@ -19,6 +19,7 @@ using Microsoft.Win32;
 using System.Management;
 using System.Text.RegularExpressions;
 using System.Threading;
+using System.Data.Common;
 
 namespace UDA
 {
@@ -252,6 +253,42 @@ namespace UDA
         }
     }
 
+    internal sealed class SetupDatabaseForm : Form
+    {
+        private readonly TextBox host = new TextBox(), database = new TextBox(), user = new TextBox(), password = new TextBox(), ca = new TextBox();
+        private readonly NumericUpDown port = new NumericUpDown { Minimum = 1, Maximum = 65535, Value = 3306 };
+        private readonly ComboBox ssl = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList };
+        public string Connection { get; private set; }
+        public SetupDatabaseForm(string existing)
+        {
+            Text = "MySQL / MariaDB 数据库配置"; ClientSize = new Size(580, 410); StartPosition = FormStartPosition.CenterParent;
+            Font = new Font("Microsoft YaHei UI", 9F); password.UseSystemPasswordChar = true;
+            ssl.Items.AddRange(MigrationConnectionOptions.SslModes); ssl.SelectedIndex = 0;
+            var layout = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(16), ColumnCount = 2, RowCount = 9 };
+            layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 140)); layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            Control[] fields = { host, port, database, user, password, ssl, ca };
+            string[] labels = { "数据库地址", "端口", "库名（须已创建）", "数据库用户名", "数据库密码", "TLS / SSL", "CA 证书路径（可选）" };
+            for (int i = 0; i < fields.Length; i++) { fields[i].Dock = DockStyle.Fill; layout.Controls.Add(new Label { Text = labels[i], AutoSize = true }, 0, i); layout.Controls.Add(fields[i], 1, i); layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 38)); }
+            var status = new Label { AutoSize = true, Dock = DockStyle.Fill, Text = "连接通过验证后才能保存；密码以本机加密方式保存。" }; layout.Controls.Add(status, 0, 7); layout.SetColumnSpan(status, 2);
+            var save = new Button { Text = "测试连接并保存", Dock = DockStyle.Fill }; layout.Controls.Add(save, 1, 8); Controls.Add(layout);
+            if (!string.IsNullOrEmpty(existing))
+            {
+                var b = new DbConnectionStringBuilder { ConnectionString = existing };
+                host.Text = Value(b, "Server", "Host"); database.Text = Value(b, "Database"); user.Text = Value(b, "User ID", "UserID", "User", "Uid"); password.Text = Value(b, "Password", "Pwd"); ca.Text = Value(b, "SslCa", "SSL CA");
+                uint n; if (uint.TryParse(Value(b, "Port"), out n) && n > 0 && n <= 65535) port.Value = n;
+                string mode = Value(b, "SslMode", "SSL Mode"); foreach (string item in ssl.Items) if (string.Equals(item, mode, StringComparison.OrdinalIgnoreCase)) ssl.SelectedItem = item;
+            }
+            if (!string.IsNullOrEmpty(existing)) { foreach (Control field in fields) field.Enabled = false; status.Text = "已带出原数据库配置。更换连接请使用独立数据库迁移工具。"; }
+            save.Click += async delegate {
+                save.Enabled = false;
+                try { string connection = string.IsNullOrEmpty(existing) ? MigrationConnectionOptions.Build(host.Text, (uint)port.Value, database.Text, user.Text, password.Text, Convert.ToString(ssl.SelectedItem), ca.Text) : existing; status.Text = "正在测试数据库连接…"; await Task.Run(() => ServerStorage.TestSetupConnection(connection)); Connection = connection; DialogResult = DialogResult.OK; }
+                catch (Exception ex) { status.Text = "连接验证失败，请检查地址、权限、TLS 和数据库状态。"; MessageBox.Show(this, ServerStorage.DatabaseFailureMessage(ex), "数据库连接失败"); }
+                finally { save.Enabled = true; }
+            };
+        }
+        private static string Value(DbConnectionStringBuilder b, params string[] keys) { foreach (string key in keys) if (b.ContainsKey(key)) return Convert.ToString(b[key]); return ""; }
+    }
+
     internal sealed class ServerSetupForm : Form
     {
         private readonly TextBox _repo = Box();
@@ -268,14 +305,17 @@ namespace UDA
         private readonly CheckBox _resetCredentials = new CheckBox { Text = "重置管理员凭据", AutoSize = true, Dock = DockStyle.Left };
         private readonly object _outputLock = new object();
         private readonly StringBuilder _processOutput = new StringBuilder();
+        private string _databaseConnection, _databaseRoot;
+        private bool _databaseFromExisting;
+        private readonly Button _databaseButton = new Button { Text = "配置 MySQL / MariaDB（必填）", Dock = DockStyle.Fill };
 
         public ServerSetupForm()
         {
-            Text = "万能驱动助手 · 服务端安装程序 v5.3.9";
+            Text = "万能驱动助手 · 服务端安装程序 v5.3.45";
             Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath);
             StartPosition = FormStartPosition.CenterScreen;
             MinimumSize = new Size(620, 600);
-            ClientSize = new Size(700, 650);
+            ClientSize = new Size(700, 700);
             AutoScroll = true;
             Font = new Font("Microsoft YaHei UI", 9F);
             _password.UseSystemPasswordChar = _confirm.UseSystemPasswordChar = true;
@@ -301,7 +341,7 @@ namespace UDA
             }
             catch { }
 
-            var layout = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(24), ColumnCount = 2, RowCount = 12 };
+            var layout = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(24), ColumnCount = 2, RowCount = 13 };
             layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 145));
             layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
             layout.Controls.Add(new Label { Text = "驱动目录", AutoSize = true, Anchor = AnchorStyles.Left }, 0, 0);
@@ -319,7 +359,7 @@ namespace UDA
             Add(layout, "管理员密码", _password, 4);
             Add(layout, "确认密码", _confirm, 5);
             layout.Controls.Add(_resetCredentials, 1, 6);
-            var note = new Label { Text = "v5.3.9：机型专用整包优先；升级须已迁移 MySQL，校验后清理散装驱动副本。", AutoSize = true, MaximumSize = new Size(500, 0), ForeColor = Color.DimGray };
+            var note = new Label { Text = "v5.3.45：机型专用整包优先；升级须已迁移 MySQL，校验后清理散装驱动副本。", AutoSize = true, MaximumSize = new Size(500, 0), ForeColor = Color.DimGray };
             layout.Controls.Add(note, 1, 7);
             layout.Controls.Add(_status, 1, 8);
             layout.Controls.Add(_progress, 1, 9);
@@ -327,6 +367,10 @@ namespace UDA
             layout.Controls.Add(_uninstall, 1, 11);
             for (int i = 0; i < 11; i++) layout.RowStyles.Add(new RowStyle(SizeType.Absolute, i == 7 ? 62 : 44));
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 48));
+            Add(layout, "数据库配置", _databaseButton, 12);
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 44));
+            _databaseButton.Click += delegate { ConfigureDatabase(); };
+            Shown += delegate { LoadDatabase(); if (string.IsNullOrEmpty(_databaseConnection)) ConfigureDatabase(); };
             Controls.Add(layout);
             _install.Click += Install;
             _uninstall.Click += Uninstall;
@@ -340,6 +384,28 @@ namespace UDA
         }
 
         private static TextBox Box() { return new TextBox { Dock = DockStyle.Fill, Margin = new Padding(3, 8, 3, 3) }; }
+        private void LoadDatabase()
+        {
+            string root = _repo.Text.Trim();
+            if (_databaseRoot == root) return;
+            string enteredConnection = _databaseFromExisting ? null : _databaseConnection;
+            _databaseConnection = null; _databaseRoot = root; _databaseFromExisting = false;
+            try {
+                if (Directory.Exists(root)) _databaseConnection = ServerStorage.SetupConnection(root);
+                _databaseFromExisting = !string.IsNullOrEmpty(_databaseConnection);
+                if (!_databaseFromExisting) _databaseConnection = enteredConnection;
+                _databaseButton.Text = _databaseFromExisting ? "已读取现有数据库配置 · 查看 / 测试" : string.IsNullOrEmpty(_databaseConnection) ? "配置 MySQL / MariaDB（必填）" : "数据库连接已填写 · 查看 / 测试";
+            }
+            catch { _databaseConnection = enteredConnection; _databaseButton.Text = "请重新填写数据库连接（原配置可能来自其他机器）"; }
+        }
+        private bool ConfigureDatabase()
+        {
+            LoadDatabase();
+            try { ServerStorage.UseProviderDirectory(Path.Combine(PrepareMedia(), "DatabaseProvider")); }
+            catch { Fail("数据库运行库加载失败，请使用完整安装包。"); return false; }
+            using (var form = new SetupDatabaseForm(_databaseConnection))
+            { if (form.ShowDialog(this) != DialogResult.OK) return false; _databaseConnection = form.Connection; _databaseButton.Text = "数据库连接验证通过 · 查看 / 测试"; return true; }
+        }
         private static void Add(TableLayoutPanel p, string label, Control value, int row)
         { p.Controls.Add(new Label { Text = label, AutoSize = true, Anchor = AnchorStyles.Left }, 0, row); p.Controls.Add(value, 1, row); }
 
@@ -371,6 +437,9 @@ namespace UDA
                 if (!File.Exists(Path.Combine(source, "UDA-Server-Manager.exe"))) { Fail("安装介质不完整：缺少 UDA-Server-Manager.exe。"); return; }
                 if (!File.Exists(Path.Combine(source, "UDA-Database-Migration.exe"))) { Fail("安装介质不完整：缺少 UDA-Database-Migration.exe。"); return; }
             if (!Directory.Exists(_repo.Text)) { Fail("请选择存在的驱动目录。"); return; }
+            LoadDatabase();
+            if (string.IsNullOrEmpty(_databaseConnection) && !ConfigureDatabase()) { Fail("必须配置 MySQL / MariaDB 才能安装。"); return; }
+            string databaseConnection = _databaseConnection;
             bool indexed = File.Exists(Path.Combine(_repo.Text, "repo.manifest.json")) || ServerStorage.Config(_repo.Text).Enabled;
             bool hasInf = false;
             if (!indexed) try { hasInf = Directory.EnumerateFiles(_repo.Text, "*.inf", SearchOption.AllDirectories).Any(); } catch { }
@@ -392,7 +461,16 @@ namespace UDA
                 string existingRepository = previousCommand.Length > 0 ? ServerSetupDiscovery.ReadArgument(previousCommand, "--repo") : _repo.Text;
                 if (previousCommand.Length > 0 && !string.Equals(Path.GetFullPath(existingRepository).TrimEnd('\\'), Path.GetFullPath(_repo.Text).TrimEnd('\\'), StringComparison.OrdinalIgnoreCase)) throw new InvalidOperationException("升级必须使用已迁移的原仓库目录，不能替换为新的驱动源目录");
                 _status.Text = "正在验证 MySQL 数据迁移与连接（尚未停止旧服务）…";
-                await Task.Run(() => ServerStorage.RequireMigratedDatabase(existingRepository));
+                if (previousCommand.Length > 0 || ServerStorage.Config(existingRepository).Enabled)
+                {
+                    if (ServerStorage.SetupConnectionNeedsRebind(existingRepository)) {
+                        _status.Text = "正在验证原仓库数据集并为本机重新保存数据库连接…";
+                        await Task.Run(() => ServerStorage.RebindSetupConnection(existingRepository, databaseConnection));
+                    }
+                    await Task.Run(() => ServerStorage.RequireMigratedDatabase(existingRepository));
+                    if (databaseConnection != ServerStorage.SetupConnection(existingRepository)) throw new InvalidOperationException("升级时请保留现有数据库连接；如需更换数据库，请先使用独立迁移工具完成迁移。");
+                }
+                else await Task.Run(() => ServerStorage.TestSetupConnection(databaseConnection));
             }
             catch (Exception ex) { _install.Enabled = true; _progress.Visible = false; Fail(ex.Message); return; }
             string previousExe = ServerUpgrade.ServiceExecutable(previousCommand);
@@ -425,7 +503,7 @@ namespace UDA
                 string migrationManager = Path.Combine(source, "UDA-Database-Migration.exe");
                 File.Copy(migrationManager, Path.Combine(target, "UDA-Database-Migration.exe"), true);
                 foreach (string runtimeConfig in Directory.GetFiles(source, "*.exe.config")) File.Copy(runtimeConfig, Path.Combine(target, Path.GetFileName(runtimeConfig)), true);
-                foreach (string name in new[] { "OfflineRepoGenerator.exe", "README.md", "DEPLOY-LAN.md", "DATABASE-MIGRATION.md", "Verify-PhysicalNetworkClient.ps1" })
+                foreach (string name in new[] { "OfflineRepoGenerator.exe", "README.md", "Collect-UdaDriverFailure.ps1", "HP-AUDIO.md", "EXTENSION-DRIVERS.md", "MANUAL-DRIVER-VERSIONS.md", "DEPLOY-LAN.md", "DATABASE-MIGRATION.md", "Verify-PhysicalNetworkClient.ps1" })
                 { string f = Path.Combine(source, name); if (File.Exists(f)) File.Copy(f, Path.Combine(target, name), true); }
                 string selectedDir = Path.GetFullPath(_repo.Text);
                 string repoPath = selectedDir;
@@ -453,6 +531,11 @@ namespace UDA
                         try { File.WriteAllText(errorLog, details, new UTF8Encoding(false)); } catch { }
                         throw new InvalidOperationException("驱动仓库生成失败，退出代码 " + exit + "。\n目标目录：" + repoPath + "\n错误日志：" + errorLog + "\n\n" + details);
                     }
+                }
+                if (!ServerStorage.Config(repoPath).Enabled)
+                {
+                    _status.Text = "正在将首次安装的仓库数据迁入 MySQL…";
+                    await Task.Run(() => ServerStorage.Migrate(repoPath, databaseConnection));
                 }
                 _status.Text = "正在为仓库中的每个驱动预生成快速下载包…"; Refresh();
                 int packageExit = await RunStreaming(Path.Combine(target, "OfflineRepoGenerator.exe"), "--repo " + Quote(repoPath) + " --prepare-packages");
@@ -570,7 +653,9 @@ namespace UDA
                 }
                 string errorLog = Path.Combine(Path.GetTempPath(), "UDA-Server-Setup-install-error.log");
                 try { File.WriteAllText(errorLog, DateTime.Now.ToString("o") + Environment.NewLine + ex + Environment.NewLine + recovery, new UTF8Encoding(false)); } catch { errorLog = "（无法写入临时诊断日志）"; }
-                Fail("安装失败：" + ex.Message + recovery + "\n详细诊断：" + errorLog);
+                string summary = ex.Message;
+                if (summary.Length > 1600) summary = summary.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() + "\n" + ServerUpgrade.SetupFailureSummary(summary);
+                Fail("安装失败：" + summary + recovery + "\n详细诊断：" + errorLog);
             }
             _progress.Visible = false; _install.Enabled = true;
         }
@@ -608,7 +693,7 @@ namespace UDA
             using (RegistryKey key = Registry.LocalMachine.CreateSubKey(@"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\UniversalDriverAssistantServer"))
             {
                 key.SetValue("DisplayName", "万能驱动助手服务端");
-                key.SetValue("DisplayVersion", "5.3.9");
+                key.SetValue("DisplayVersion", "5.3.45");
                 key.SetValue("Publisher", "Universal Driver Assistant");
                 key.SetValue("InstallLocation", Path.GetDirectoryName(installedSetup));
                 key.SetValue("UninstallString", "\"" + installedSetup + "\"");
@@ -685,25 +770,16 @@ namespace UDA
         private Task<int> RunStreaming(string file, string args)
         {
             lock (_outputLock) _processOutput.Length = 0;
-            var done = new TaskCompletionSource<int>();
-            var p = new Process { StartInfo = new ProcessStartInfo(file, args) { UseShellExecute = false, CreateNoWindow = true, WindowStyle = ProcessWindowStyle.Hidden, RedirectStandardOutput = true, RedirectStandardError = true }, EnableRaisingEvents = true };
-            DataReceivedEventHandler update = delegate(object sender, DataReceivedEventArgs e)
-            {
-                if (string.IsNullOrWhiteSpace(e.Data)) return;
-                lock (_outputLock)
-                {
-                    _processOutput.AppendLine(e.Data);
-                    if (_processOutput.Length > 32000) _processOutput.Remove(0, _processOutput.Length - 32000);
+            return Task.Run(() => ServerUpgrade.RunSetupProcess(file, args, line => {
+                if (string.IsNullOrWhiteSpace(line)) return;
+                lock (_outputLock) {
+                    _processOutput.AppendLine(line);
+                    if (_processOutput.Length > 128000) _processOutput.Remove(0, _processOutput.Length - 128000);
                 }
-                try { BeginInvoke((Action)delegate { _status.Text = e.Data.StartsWith("PROGRESS: ", StringComparison.Ordinal) ? e.Data.Substring(10) : e.Data; }); } catch { }
-            };
-            p.OutputDataReceived += update;
-            p.ErrorDataReceived += update;
-            p.Exited += delegate { int code = p.ExitCode; p.Dispose(); done.TrySetResult(code); };
-            try { p.Start(); p.BeginOutputReadLine(); p.BeginErrorReadLine(); }
-            catch (Exception ex) { p.Dispose(); done.TrySetException(ex); }
-            return done.Task;
+                try { BeginInvoke((Action)delegate { _status.Text = line.StartsWith("PROGRESS: ", StringComparison.Ordinal) ? line.Substring(10) : line; }); } catch { }
+            }));
         }
+
         private static string RandomToken()
         {
             byte[] b = new byte[32]; using (var rng = RandomNumberGenerator.Create()) rng.GetBytes(b);

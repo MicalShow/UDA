@@ -1,4 +1,4 @@
-﻿# 迁移前完整检查与补迁
+# 迁移前完整检查与补迁
 
 旧版迁移遗漏数据时，请使用新的独立工具，参见 [完整迁移准备工具](MIGRATION-PREFLIGHT.md)。工具在旧服务端本机运行，先验证管理员身份，自动暂停/恢复注册服务，补齐数据后保留旧模式与本地原件，再执行正式升级。构建：`powershell.exe -NoProfile -ExecutionPolicy Bypass -File Build-MigrationPreflight.ps1`。
 

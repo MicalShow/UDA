@@ -1,4 +1,4 @@
-param([string]$OutputDirectory = 'bin')
+﻿param([string]$OutputDirectory = 'bin')
 $ErrorActionPreference = 'Stop'
 $buildRoot = Join-Path $PSScriptRoot $OutputDirectory
 Add-Type -AssemblyName System.Windows.Forms

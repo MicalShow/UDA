@@ -1,4 +1,4 @@
-﻿const fs=require('fs'),vm=require('vm');
+const fs=require('fs'),vm=require('vm');
 const html=fs.readFileSync(process.argv[2],'utf8');
 const fn=html.match(/async function loadInstallLogs\(\)\{[\s\S]*?\nlet logPage=/)[0].replace(/\nlet logPage=$/,'');
 const pending=[];

@@ -1,4 +1,4 @@
-param([string]$OutputDirectory='release-v5.1.0')
+﻿param([string]$OutputDirectory='release-v5.1.0')
 $ErrorActionPreference='Stop'
 Add-Type -AssemblyName System.Web.Extensions
 [void][Reflection.Assembly]::LoadFrom((Join-Path $PSScriptRoot ($OutputDirectory+'\Lan\LanDriverService.exe')))

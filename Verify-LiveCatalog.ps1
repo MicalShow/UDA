@@ -1,4 +1,4 @@
-param([string]$OutputDirectory = 'web-console-live-catalog', [switch]$ImportSignedPackage)
+﻿param([string]$OutputDirectory = 'web-console-live-catalog', [switch]$ImportSignedPackage)
 $ErrorActionPreference = 'Stop'
 [void][Reflection.Assembly]::LoadFrom((Join-Path $PSScriptRoot ($OutputDirectory + '\Lan\UDA-Server-Manager.exe')))
 $token = [Threading.CancellationToken]::None

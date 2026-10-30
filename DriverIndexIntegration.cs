@@ -1,4 +1,4 @@
-﻿// DriverIndexIntegration.cs - Phase 2: wires the Phase 1 driver index core into the engine.
+// DriverIndexIntegration.cs - Phase 2: wires the Phase 1 driver index core into the engine.
 //
 // This file is the integration layer between DriverIndexCore.cs (Phase 1, offline index) and the
 // existing UniversalDriverAssistant engine (E). It provides:
@@ -58,6 +58,74 @@ namespace UDA
     /// <summary>Read the device's configured driver binding directly; never infer it from package history.</summary>
     public static class CurrentDriverState
     {
+        [DllImport("cfgmgr32.dll", CharSet = CharSet.Unicode, ExactSpelling = true)]
+        private static extern uint CM_Get_Device_ID_List_SizeW(out uint length, string filter, uint flags);
+        [DllImport("cfgmgr32.dll", CharSet = CharSet.Unicode, ExactSpelling = true)]
+        private static extern uint CM_Get_Device_ID_ListW(string filter, char[] buffer, uint length, uint flags);
+        internal static void MergePresentDevices(List<D> devices, IEnumerable<string> ids)
+        {
+            var known = new HashSet<string>(devices.Select(d => d.Id), StringComparer.OrdinalIgnoreCase);
+            foreach (string id in ids)
+                if (!string.IsNullOrWhiteSpace(id) && known.Add(id)) devices.Add(new D { Id = id, Name = id });
+        }
+        public static void CompletePresentInventory(List<D> devices, L logger)
+        {
+            try {
+                // PRESENT, not ALL: retain disabled devices but do not add phantom history.
+                for (int attempt = 0; attempt < 4; attempt++) {
+                    uint length;
+                    if (CM_Get_Device_ID_List_SizeW(out length, null, 0x100) != 0 || length > 16 * 1024 * 1024) throw new InvalidOperationException("Cannot size native PnP inventory");
+                    var buffer = new char[length];
+                    uint result = CM_Get_Device_ID_ListW(null, buffer, length, 0x100);
+                    if (result == 0x1A) continue; // enumeration changed between size and read
+                    if (result != 0) throw new InvalidOperationException("Cannot read native PnP inventory: " + result);
+                    int before = devices.Count;
+                    MergePresentDevices(devices, new string(buffer).Split('\0'));
+                    foreach (var device in devices.Skip(before)) {
+                        uint node;
+                        if (CM_Locate_DevNodeW(out node, device.Id, 0) == 0) {
+                            device.Name = ReadDeviceText(node, 14) ?? ReadDeviceText(node, 2) ?? device.Id;
+                            device.Class = ReadDeviceText(node, 9) ?? "";
+                            device.Maker = ReadDeviceText(node, 13) ?? "";
+                        }
+                        RefreshDevice(device, logger);
+                    }
+                    if (logger != null) logger.W("[INFO] Native PnP inventory: WMI=" + before + "; added=" + (devices.Count - before) + "; total=" + devices.Count);
+                    return;
+                }
+                throw new InvalidOperationException("Native PnP inventory kept changing");
+            } catch (Exception ex) { throw new InvalidOperationException("无法完成原生设备清单核验 / Native PnP inventory incomplete", ex); }
+        }
+        private static string ReadDeviceText(uint node, uint id)
+        {
+            var key = new PropertyKey { Format = new Guid("a45c254e-df1c-4efd-8020-67d146a850e0"), Id = id };
+            uint type, size = 0;
+            uint result = CM_Get_DevNode_PropertyW(node, ref key, out type, null, ref size, 0);
+            if ((result != 0 && result != 0x1A) || size == 0 || size > 65536) return null;
+            var bytes = new byte[size];
+            return CM_Get_DevNode_PropertyW(node, ref key, out type, bytes, ref size, 0) == 0 && type == 0x12 ? Encoding.Unicode.GetString(bytes).TrimEnd('\0') : null;
+        }
+        internal static Func<string, IList<string>> TestExtensionInfPaths;
+        // This property lists extensions actually applied to this devnode, not merely staged OEM INFs.
+        public static IList<string> ExtensionInfPaths(string instanceId)
+        {
+            if (TestExtensionInfPaths != null) return TestExtensionInfPaths(instanceId);
+            try
+            {
+                uint node, type, size = 0;
+                if (CM_Locate_DevNodeW(out node, instanceId, 0) != 0) return null;
+                var key = new PropertyKey { Format = new Guid("540b947e-8b40-45bc-a8a2-6a0b894cbda2"), Id = 15 };
+                uint code = CM_Get_DevNode_PropertyW(node, ref key, out type, null, ref size, 0);
+                if (code == 0x25) return new List<string>(); // CR_NO_SUCH_VALUE: no applied extensions
+                if ((code != 0 && code != 0x1A) || size > 1024 * 1024) return null;
+                if (size == 0) return new List<string>();
+                var bytes = new byte[size];
+                if (CM_Get_DevNode_PropertyW(node, ref key, out type, bytes, ref size, 0) != 0 || type != 0x2012) return null;
+                return Encoding.Unicode.GetString(bytes, 0, (int)size).Split('\0').Select(s => System.Text.RegularExpressions.Regex.Match(s, @"^(oem[0-9]+\.inf):", System.Text.RegularExpressions.RegexOptions.IgnoreCase))
+                    .Where(m => m.Success).Select(m => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "INF", m.Groups[1].Value)).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+            }
+            catch { return null; }
+        }
         public static uint? ReadRank(string instanceId)
         {
             try
@@ -88,6 +156,24 @@ namespace UDA
             if (CM_Get_DevNode_PropertyW(node, ref key, out type, bytes, ref size, 0) != 0 || type != 0x12) return null;
             return Encoding.Unicode.GetString(bytes, 0, (int)size).TrimEnd('\0');
         }
+        private static List<string> ReadDeviceIdList(uint node, uint id)
+        {
+            var key = new PropertyKey { Format = new Guid("a45c254e-df1c-4efd-8020-67d146a850e0"), Id = id };
+            uint type, size = 0;
+            uint code = CM_Get_DevNode_PropertyW(node, ref key, out type, null, ref size, 0);
+            if (code == 0x25) return new List<string>();
+            if ((code != 0 && code != 0x1A) || size > 1024 * 1024 || size % 2 != 0) return null;
+            if (size == 0) return new List<string>();
+            var bytes = new byte[size];
+            if (CM_Get_DevNode_PropertyW(node, ref key, out type, bytes, ref size, 0) != 0 || type != 0x2012) return null;
+            return Encoding.Unicode.GetString(bytes, 0, (int)size).Split('\0').Where(v => v.Length > 0).ToList();
+        }
+        internal static void ApplyDeviceIdentifiers(D device, List<string> hardware, List<string> compatible)
+        {
+            // A successful native read is authoritative. Failure (null) retains WMI values.
+            if (hardware != null) device.H = hardware.Select(HardwareIdNormalizer.Normalize).Where(v => v.Length > 0).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+            if (compatible != null) device.K = compatible.Select(HardwareIdNormalizer.Normalize).Where(v => v.Length > 0).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+        }
         public static bool RefreshDevice(D device, L logger)
         {
             if (device == null || string.IsNullOrWhiteSpace(device.Id)) return false;
@@ -95,14 +181,27 @@ namespace UDA
             {
                 uint node;
                 if (CM_Locate_DevNodeW(out node, device.Id, 0) != 0) return false;
+                ApplyDeviceIdentifiers(device, ReadDeviceIdList(node, 3), ReadDeviceIdList(node, 4));
+                // Missing drivers have no binding properties. Read the problem code before
+                // attempting those properties, otherwise stale WMI data can hide Code 28.
+                uint status, problem;
+                if (CM_Get_DevNode_Status(out status, out problem, node, 0) == 0)
+                {
+                    ApplyProblemStatus(device, (int)problem);
+                    if (problem == 28) return false;
+                }
                 string inf = Read(node, 5), version = Read(node, 3);
                 if (string.IsNullOrWhiteSpace(inf) || string.IsNullOrWhiteSpace(version)) return false;
                 ApplyBinding(device, inf, version, logger);
-                uint status, problem;
-                if (CM_Get_DevNode_Status(out status, out problem, node, 0) == 0) device.Error = (int)problem;
                 return true;
             }
             catch (Exception ex) { if (logger != null) logger.W("[WARN] 原生驱动状态读取失败，保留 WMI / Native binding unavailable: " + device.Id + " " + ex.Message); return false; }
+        }
+        internal static void ApplyProblemStatus(D device, int problem)
+        {
+            if (device == null) return;
+            device.Error = problem;
+            if (problem == 28) { device.Inf = ""; device.Version = ""; }
         }
         public static bool ApplyBinding(D device, string inf, string version, L logger)
         {
@@ -295,6 +394,37 @@ namespace UDA
         public static bool? IsBetterForDevice(D device, string candidateInf)
         {
             return IsBetterForDevice(device, candidateInf, null);
+        }
+
+        internal static Func<D, string, uint, bool?> TestCompatibilityProbe;
+        public static bool? IsCompatibleWithDevice(D device, string candidateInf, Action<string> trace)
+        {
+            // ExcludeFromSelect hides manual choices; it does not prohibit PnP installation.
+            // The missing-driver probe must enumerate the same PnP drivers as the ranking probes.
+            const uint includePnpDrivers = 0x00000800; // DI_FLAGSEX_ALLOWEXCLUDEDDRVS
+            if (trace != null) trace("Native compatible driver probe includes ExcludeFromSelect PnP entries: " + Path.GetFileName(candidateInf));
+            if (TestCompatibilityProbe != null) return TestCompatibilityProbe(device, candidateInf, includePnpDrivers);
+            if (device == null || string.IsNullOrEmpty(device.Id) || !File.Exists(candidateInf)) return null;
+            IntPtr set = SetupDiCreateDeviceInfoList(IntPtr.Zero, IntPtr.Zero);
+            if (set == new IntPtr(-1)) return null;
+            try
+            {
+                var data = new Device { Size = (uint)Marshal.SizeOf(typeof(Device)) };
+                if (!SetupDiOpenDeviceInfoW(set, device.Id, IntPtr.Zero, 0, ref data)) return null;
+                var options = new Parameters { Size = (uint)Marshal.SizeOf(typeof(Parameters)) };
+                if (!SetupDiGetDeviceInstallParamsW(set, ref data, ref options)) return null;
+                options.Flags |= 0x00010000; // DI_ENUMSINGLEINF: read-only compatibility check
+                options.FlagsEx |= includePnpDrivers;
+                options.Path = Path.GetFullPath(candidateInf);
+                if (options.Path.Length >= 260 || !SetupDiSetDeviceInstallParamsW(set, ref data, ref options) || !SetupDiBuildDriverInfoList(set, ref data, 2)) return null;
+                var driver = new Driver { Size = (uint)Marshal.SizeOf(typeof(Driver)) };
+                if (SetupDiEnumDriverInfoW(set, ref data, 2, 0, ref driver)) return true;
+                int error = Marshal.GetLastWin32Error();
+                if (trace != null) trace("Native compatible driver probe: Win32=" + error);
+                return error == 259 ? (bool?)false : null; // ERROR_NO_MORE_ITEMS
+            }
+            catch { return null; }
+            finally { SetupDiDestroyDeviceInfoList(set); }
         }
 
         public static bool? IsBetterForDevice(D device, string candidateInf, Action<string> trace, DriverScanFiles files = null)
@@ -676,11 +806,35 @@ namespace UDA
     /// <summary>Runs pnputil /add-driver ... /install for one accepted INF. The default shells out to
     /// pnputil via ProcessRunner; the fake records the call and returns a scripted result for tests.</summary>
     public interface IPnpInstallRunner { InstallResult AddInstall(string infPath, int timeoutSeconds, L logger); }
+    public interface IPnpDeviceInstallRunner { InstallResult AddInstallForDevice(string infPath, string deviceInstanceId, int timeoutSeconds, L logger); }
+    public sealed class SelectedDeviceInstallRunner : IPnpInstallRunner
+    {
+        private readonly IPnpDeviceInstallRunner inner; private readonly string device;
+        public SelectedDeviceInstallRunner(IPnpDeviceInstallRunner inner, string device) { if (inner == null || string.IsNullOrWhiteSpace(device)) throw new ArgumentException("Explicit device installation requires a device-aware runner"); this.inner = inner; this.device = device; }
+        public InstallResult AddInstall(string infPath, int timeoutSeconds, L logger) { return inner.AddInstallForDevice(infPath, device, timeoutSeconds, logger); }
+    }
 
     public interface IPnpPackageInstallRunner { InstallResult AddPackage(string directory, int timeoutSeconds, L logger); }
 
-    public sealed class PnpInstallRunner : IPnpInstallRunner, IPnpPackageInstallRunner
+    public sealed class PnpInstallRunner : IPnpInstallRunner, IPnpPackageInstallRunner, IPnpDeviceInstallRunner
     {
+        public InstallResult AddInstallForDevice(string infPath, string deviceInstanceId, int timeoutSeconds, L logger)
+        {
+            string helper = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "UDA-Driver-Selection.exe");
+            if (!File.Exists(helper)) throw new FileNotFoundException("缺少手动选版安装组件，请重新生成完整客户端", helper);
+            if (string.IsNullOrWhiteSpace(deviceInstanceId) || deviceInstanceId.Contains("\"") || infPath.Contains("\"")) throw new ArgumentException("Invalid selected device or INF");
+            if (logger != null) logger.W("[INFO] 手动选版按设备安装 / Explicit selected driver: " + deviceInstanceId + "; INF=" + infPath + "; timeout=" + timeoutSeconds);
+            var elapsed = System.Diagnostics.Stopwatch.StartNew();
+            // Stage all package files without asking PnPUtil to choose/bind a driver.
+            var staged = ProcessRunner.Run("pnputil.exe", "/add-driver \"" + Path.GetFullPath(infPath) + "\"", timeoutSeconds);
+            if (logger != null) logger.W("[INFO] Selected package staging exit=" + staged.Item1 + "\n" + staged.Item2);
+            if (staged.Item3 || (staged.Item1 != 0 && staged.Item1 != 3010 && staged.Item1 != 259)) return InstallPlanner.ResultFrom(staged.Item1, staged.Item3, staged.Item2);
+            int remaining = timeoutSeconds - (int)Math.Ceiling(elapsed.Elapsed.TotalSeconds);
+            if (remaining <= 0) return InstallPlanner.ResultFrom(-1, true, "Selected package installation timed out while staging");
+            var output = ProcessRunner.Run(helper, "--device \"" + deviceInstanceId + "\" --inf \"" + Path.GetFullPath(infPath) + "\"", remaining);
+            if (logger != null) logger.W("[INFO] Selected driver exit=" + output.Item1 + "\n" + output.Item2);
+            return InstallPlanner.ResultFrom(output.Item1 == 0 && staged.Item1 == 3010 ? 3010 : output.Item1, output.Item3, output.Item2);
+        }
         public InstallResult AddPackage(string directory, int timeoutSeconds, L logger)
         {
             string root = Path.GetFullPath(directory);
@@ -694,6 +848,7 @@ namespace UDA
         public InstallResult AddInstall(string infPath, int timeoutSeconds, L logger)
         {
             string args = InstallPlanner.BuildArguments(infPath);
+            if (logger != null) logger.W("[INFO] 单驱动安装 / Driver install: timeout=" + timeoutSeconds + " seconds; INF=" + infPath);
             var t = ProcessRunner.Run("pnputil.exe", args, timeoutSeconds);
             var result = InstallPlanner.ResultFrom(t.Item1, t.Item3, t.Item2);
             if (logger != null) logger.W("[INFO] pnputil exit=" + result.ExitCode + " (" + result.Outcome + ") " + infPath);
@@ -704,8 +859,10 @@ namespace UDA
 
     /// <summary>Offline runner for tests. Records every invocation (with the safe arguments) and returns
     /// scripted exit codes from a queue, or DefaultExitCode when the queue is empty.</summary>
-    public sealed class FakePnpInstallRunner : IPnpInstallRunner, IPnpPackageInstallRunner
+    public sealed class FakePnpInstallRunner : IPnpInstallRunner, IPnpPackageInstallRunner, IPnpDeviceInstallRunner
     {
+        public readonly List<string> SelectedDeviceCalls = new List<string>();
+        public InstallResult AddInstallForDevice(string infPath, string deviceInstanceId, int timeoutSeconds, L logger) { SelectedDeviceCalls.Add(deviceInstanceId); return AddInstall(infPath, timeoutSeconds, logger); }
         public readonly List<string> PackageCalls = new List<string>();
         public readonly List<string> PackageInfFiles = new List<string>();
         public InstallResult AddPackage(string directory, int timeoutSeconds, L logger)

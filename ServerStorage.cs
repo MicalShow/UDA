@@ -1,4 +1,4 @@
-﻿// Server-only optional MySQL/MariaDB persistence. Protocol v1 and driver files are unchanged.
+// Server-only optional MySQL/MariaDB persistence. Protocol v1 and driver files are unchanged.
 using System;
 using System.Collections.Generic;
 using System.Collections.Concurrent;
@@ -15,6 +15,10 @@ using System.Web.Script.Serialization;
 
 namespace UDA
 {
+    public sealed class RetiredDriverDownload
+    {
+        public string Path = "", Package = "", Hash = "", Archive = "", ExpiresUtc = "";
+    }
     public sealed class ServerStorageConfig
     {
         public int Version = 1;
@@ -82,7 +86,12 @@ namespace UDA
         }
         private static long _revision;
         public static long Revision { get { return System.Threading.Interlocked.Read(ref _revision); } }
-        private static readonly object ArchiveGate = new object();
+        private static readonly ConcurrentDictionary<string, object> ArchiveGates = new ConcurrentDictionary<string, object>(StringComparer.OrdinalIgnoreCase);
+        internal static void ReleaseWorkspaceGates(string root)
+        {
+            string prefix = Path.GetFullPath(root) + "|";
+            foreach (string key in ArchiveGates.Keys.Where(k => k.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))) { object ignored; ArchiveGates.TryRemove(key, out ignored); }
+        }
         public static string Archive(string root, string source, string packagePrefix = "", bool create = true, IProgress<string> progress = null)
         {
             var manifest = OfflineRepoGenerator.TryLoadManifest(root); if (manifest == null) throw new InvalidOperationException("仓库尚未就绪");
@@ -93,7 +102,7 @@ namespace UDA
                 identity = BitConverter.ToString(sha.ComputeHash(Encoding.UTF8.GetBytes("model-scope-v2|" + scope))).Replace("-", "").ToLowerInvariant();
                 legacy = BitConverter.ToString(sha.ComputeHash(Encoding.UTF8.GetBytes(source + "|" + packagePrefix + "|" + manifest.IntegrityHash))).Replace("-", "").ToLowerInvariant();
             }
-            lock (ArchiveGate)
+            lock (ArchiveGates.GetOrAdd(Path.GetFullPath(root) + "|" + identity, key => new object()))
             {
                 string aliasText = ServerStorage.Read(root, "repo.model-archive-identities.json");
                 var aliases = aliasText == null ? new Dictionary<string, string>() : new JavaScriptSerializer { MaxJsonLength = int.MaxValue }.Deserialize<Dictionary<string, string>>(aliasText) ?? new Dictionary<string, string>();
@@ -104,7 +113,7 @@ namespace UDA
                     ServerStorage.Write(root, "repo.model-archive-identities.json", new JavaScriptSerializer { MaxJsonLength = int.MaxValue }.Serialize(aliases), false);
                     identity = legacy;
                 }
-                string destination = Path.Combine(root, ".uda-downloads", "model-" + identity + ".zip");
+                string destination = ServerStorage.ResolveOnlineArchive(root, "model-" + identity + ".zip");
                 if (!create) return destination;
                 if (File.Exists(destination)) return destination;
                 var entries = manifest.Entries.Where(e => Contains(e, new MachineDriverPackage { SourceName = source, PackagePrefix = packagePrefix })).ToList(); if (entries.Count == 0) throw new InvalidDataException("专用机型整包已不存在，禁止通用回退");
@@ -233,6 +242,8 @@ namespace UDA
                 }
             }
             File.WriteAllText(Path.Combine(root, "repo.manifest.json"), OfflineRepoGenerator.SerializeManifest(manifest), new UTF8Encoding(false));
+            string pathAliases = ServerStorage.Read(root, "repo.path-aliases.json");
+            if (pathAliases != null) File.WriteAllText(Path.Combine(root, "repo.path-aliases.json"), pathAliases, new UTF8Encoding(false));
             if (!File.Exists(Path.Combine(root, "repo.udadb")))
             {
                 string stateText = ServerStorage.Read(root, "repo.index-state.json");
@@ -335,7 +346,8 @@ namespace UDA
             var modelPolicies = MachineDriverPackages.Load(root).GroupBy(p => p.SourceName + "\n" + p.PackagePrefix).Select(g => g.First()).Where(p => manifest.Entries.Any(e => MachineDriverPackages.Contains(e, p))).ToList();
             var modelNames = new HashSet<string>(modelPolicies.Select(p => Path.GetFileName(MachineDriverPackages.Archive(root, p.SourceName, p.PackagePrefix, false))), StringComparer.OrdinalIgnoreCase);
             string downloads = Path.Combine(root, ".uda-downloads");
-            foreach (string file in Directory.GetFiles(downloads, "*.zip")) if (!archiveHashes.ContainsKey(Path.GetFileName(file)) && !modelNames.Contains(Path.GetFileName(file))) { if ((File.GetAttributes(file) & FileAttributes.ReparsePoint) != 0) throw new IOException("Invalid archive cleanup target"); reclaimed += new FileInfo(file).Length; File.Delete(file); }
+            var retiredArchives = ServerStorage.RetainedDownloadArchiveNames(root);
+            foreach (string file in Directory.GetFiles(downloads, "*.zip")) if (!archiveHashes.ContainsKey(Path.GetFileName(file)) && !modelNames.Contains(Path.GetFileName(file)) && !retiredArchives.Contains(Path.GetFileName(file))) { if ((File.GetAttributes(file) & FileAttributes.ReparsePoint) != 0) throw new IOException("Invalid archive cleanup target"); reclaimed += new FileInfo(file).Length; File.Delete(file); }
             var modelPrevious = new Dictionary<string, ArchiveVerificationRecord>(StringComparer.OrdinalIgnoreCase);
             string modelText = ServerStorage.Read(root, "repo.model-archive-verification.json");
             try { if (modelText != null) modelPrevious = json.Deserialize<Dictionary<string, ArchiveVerificationRecord>>(modelText) ?? modelPrevious; } catch (ArgumentException) { } catch (InvalidOperationException) { }
@@ -351,6 +363,7 @@ namespace UDA
                 }
                 if (!reuse)
                 {
+                    path = ServerStorage.PrivateOnlineArchive(root, path);
                     if (File.Exists(path)) { reclaimed += new FileInfo(path).Length; File.Delete(path); }
                     MachineDriverPackages.Archive(root, policy.SourceName, policy.PackagePrefix);
                     using (var guard = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read))
@@ -365,6 +378,28 @@ namespace UDA
     }
     public static class ServerUpgrade
     {
+        internal static int RunSetupProcess(string file, string args, Action<string> output)
+        {
+            using (var process = new System.Diagnostics.Process { StartInfo = new System.Diagnostics.ProcessStartInfo(file, args) {
+                UseShellExecute = false, CreateNoWindow = true, WindowStyle = System.Diagnostics.ProcessWindowStyle.Hidden,
+                RedirectStandardOutput = true, RedirectStandardError = true } }) {
+                System.Diagnostics.DataReceivedEventHandler receive = (sender, e) => { if (e.Data != null && output != null) output(e.Data); };
+                process.OutputDataReceived += receive; process.ErrorDataReceived += receive;
+                process.Start(); process.BeginOutputReadLine(); process.BeginErrorReadLine();
+                // Parameterless WaitForExit also waits for redirected asynchronous readers.
+                process.WaitForExit();
+                return process.ExitCode;
+            }
+        }
+        internal static string SetupFailureSummary(string output)
+        {
+            var lines = (output ?? "").Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+            string error = lines.FirstOrDefault(line => line.IndexOf("ERROR:", StringComparison.OrdinalIgnoreCase) >= 0 || line.IndexOf("FATAL:", StringComparison.OrdinalIgnoreCase) >= 0);
+            if (string.IsNullOrEmpty(error)) error = lines.LastOrDefault(line => !line.StartsWith("PROGRESS:", StringComparison.OrdinalIgnoreCase));
+            if (string.IsNullOrWhiteSpace(error)) error = "子进程未提供具体错误，请查看详细诊断日志。";
+            return error.Length > 1200 ? error.Substring(0, 1200) + "…" : error;
+        }
+
         // A downloaded single EXE has no adjacent CLR configuration. Launch a configured
         // temporary copy so CPU groups and long paths also apply to the installer itself.
         internal static string PrepareInstallerRuntime(string executable, string directory)
@@ -604,6 +639,9 @@ namespace UDA
                             Put(db, tx, cfg.RepositoryId, "repo.index-state.json", Json().Serialize(new { length = stream.Length, blocks = blocks, sha256 = manifest.IndexDbHash, prefix = prefix }), false);
                         }
                         Put(db, tx, cfg.RepositoryId, "repo.deleted.txt", string.Join("\n", hashes.OrderBy(x => x)), false);
+                        string revokedText = Get(db, tx, cfg.RepositoryId, "repo.revoked-download-paths.json");
+                        var revoked = revokedText == null ? new List<string>() : Json().Deserialize<List<string>>(revokedText);
+                        Put(db, tx, cfg.RepositoryId, "repo.revoked-download-paths.json", Json().Serialize(revoked.Concat(removed.Select(e => e.RelativePath)).Distinct(StringComparer.OrdinalIgnoreCase).ToList()), false);
                         Put(db, tx, cfg.RepositoryId, "repo.manifest.json", OfflineRepoGenerator.SerializeManifest(manifest), false);
                         using (var cmd = Command(db, tx, "DELETE FROM uda_documents WHERE repository_id=@p0 AND document_key LIKE 'repo.index-block.%' AND document_key NOT LIKE @p1", cfg.RepositoryId, prefix + "%")) cmd.ExecuteNonQuery();
                         tx.Commit();
@@ -617,6 +655,181 @@ namespace UDA
         private static JavaScriptSerializer Json() { return new JavaScriptSerializer { MaxJsonLength = int.MaxValue, RecursionLimit = 512 }; }
         private static object Gate(string root) { return Gates.GetOrAdd(Path.GetFullPath(root), r => new object()); }
         public static void RunExclusive(string root, Action action) { lock (Gate(root)) action(); }
+        private static readonly ConcurrentDictionary<string, OnlineWorkspace> OnlineWorkspaces = new ConcurrentDictionary<string, OnlineWorkspace>(StringComparer.OrdinalIgnoreCase);
+        public static string ResolveOnlineArchive(string root, string name)
+        {
+            string local = Path.Combine(Path.GetFullPath(root), ".uda-downloads", name); OnlineWorkspace work;
+            if (OnlineWorkspaces.TryGetValue(Path.GetFullPath(root), out work) && !work.PrivateNames.ContainsKey(name) && !File.Exists(local))
+            { string published = Path.Combine(work.OriginalRoot, ".uda-downloads", name); if (File.Exists(published)) return published; }
+            return local;
+        }
+        public static string PrivateOnlineArchive(string root, string path)
+        {
+            OnlineWorkspace work;
+            if (!OnlineWorkspaces.TryGetValue(Path.GetFullPath(root), out work)) return path;
+            string name = Path.GetFileName(path); work.PrivateNames[name] = true;
+            return Path.Combine(work.Root, ".uda-downloads", name);
+        }
+        internal static void CleanupRetiredDownloads(string root, IEnumerable<string> activeArchives)
+        {
+            var keep = new HashSet<string>(activeArchives, StringComparer.OrdinalIgnoreCase);
+            string now = DateTime.UtcNow.ToString("o");
+            foreach (var row in Documents(root, "repo.download-history."))
+            {
+                var tickets = Json().Deserialize<List<RetiredDriverDownload>>(row.Value);
+                var retained = tickets.Where(t => string.CompareOrdinal(t.ExpiresUtc, now) > 0).ToList();
+                foreach (var ticket in retained) keep.Add(ticket.Archive);
+                if (retained.Count == 0) Delete(root, row.Key);
+            }
+            string directory = Path.GetFullPath(Path.Combine(root, ".uda-downloads"));
+            if (!Directory.Exists(directory) || (File.GetAttributes(directory) & FileAttributes.ReparsePoint) != 0) return;
+            foreach (string file in Directory.GetFiles(directory, "*.zip"))
+            {
+                if (keep.Contains(Path.GetFileName(file)) || File.GetLastWriteTimeUtc(file) > DateTime.UtcNow.AddDays(-7) || (File.GetAttributes(file) & FileAttributes.ReparsePoint) != 0) continue;
+                // Existing download handles disallow deletion on Windows. Busy archives stay for a later pass.
+                try { File.Delete(file); } catch (IOException) { } catch (UnauthorizedAccessException) { }
+            }
+        }
+        internal static HashSet<string> RetainedDownloadArchiveNames(string root)
+        {
+            var keep = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            string now = DateTime.UtcNow.ToString("o");
+            if (Config(root).Enabled) foreach (var row in Documents(root, "repo.download-history."))
+                foreach (var ticket in Json().Deserialize<List<RetiredDriverDownload>>(row.Value)) if (string.CompareOrdinal(ticket.ExpiresUtc, now) > 0) keep.Add(ticket.Archive);
+            return keep;
+        }
+        internal static void RecoverOnlineWorkspaces(string root)
+        {
+            string parent = Path.Combine(Path.GetPathRoot(Path.GetFullPath(root)), ".UDA-W");
+            if (!Directory.Exists(parent) || (File.GetAttributes(parent) & FileAttributes.ReparsePoint) != 0) return;
+            foreach (string directory in Directory.GetDirectories(parent))
+            {
+                if (!System.Text.RegularExpressions.Regex.IsMatch(Path.GetFileName(directory), "^[a-f0-9]{16}$") || (File.GetAttributes(directory) & FileAttributes.ReparsePoint) != 0) continue;
+                string marker = Path.Combine(directory, ".owner.json"); if (!File.Exists(marker) || (File.GetAttributes(marker) & FileAttributes.ReparsePoint) != 0) continue;
+                try
+                {
+                    var owner = Json().Deserialize<Dictionary<string, string>>(File.ReadAllText(marker));
+                    if (!string.Equals(owner["root"], Path.GetFullPath(root), StringComparison.OrdinalIgnoreCase)) continue;
+                    bool active = false;
+                    try { using (var process = System.Diagnostics.Process.GetProcessById(int.Parse(owner["pid"]))) active = process.StartTime.ToUniversalTime().ToString("o") == owner["start"]; } catch (ArgumentException) { }
+                    if (active) continue;
+                    var staged = Config(directory); var live = Config(root);
+                    if (staged.RepositoryId == live.RepositoryId || staged.RepositoryId != owner["id"]) continue;
+                    using (var db = Open(Connection(staged))) using (var cmd = Command(db, null, "DELETE FROM uda_documents WHERE repository_id=@p0", staged.RepositoryId)) cmd.ExecuteNonQuery();
+                    ValidateWorkspaceTree(directory); Directory.Delete(directory, true);
+                }
+                catch (Exception ex) { ServiceEventLog.Write("warning", "恢复中断维护工作区时保留待复查：" + ex.GetType().Name); }
+            }
+        }
+        private static void ValidateWorkspaceTree(string directory)
+        {
+            if ((File.GetAttributes(directory) & FileAttributes.ReparsePoint) != 0) throw new IOException("Unsafe workspace cleanup target");
+            foreach (string item in Directory.GetFileSystemEntries(directory))
+            {
+                var attributes = File.GetAttributes(item);
+                if ((attributes & FileAttributes.ReparsePoint) != 0) throw new IOException("Unsafe workspace member");
+                if ((attributes & FileAttributes.Directory) != 0) ValidateWorkspaceTree(item);
+            }
+        }
+        private static readonly string[] CatalogNames = { "repo.manifest.json", "repo.index-state.json", "repo.archive-hashes.json", "repo.archive-verification.json", "repo.model-archive-identities.json", "repo.model-archive-verification.json", "repo.machine-packages.json", "repo.path-aliases.json", "repo.category-overrides.json", "repo.deleted.txt" };
+        private static Dictionary<string, string> CatalogDocuments(DbConnection db, DbTransaction tx, string id)
+        {
+            var rows = new Dictionary<string, string>(StringComparer.Ordinal);
+            string predicate = string.Join(" OR ", CatalogNames.Select((name, i) => "document_key=@p" + (i + 1))) + " OR document_key LIKE 'repo.index-block.%'";
+            using (var cmd = Command(db, tx, "SELECT document_key,body FROM uda_documents WHERE repository_id=@p0 AND (" + predicate + ")", new object[] { id }.Concat(CatalogNames.Cast<object>()).ToArray()))
+            using (var reader = cmd.ExecuteReader()) while (reader.Read()) rows[reader.GetString(0)] = reader.GetString(1);
+            return rows;
+        }
+        // Each writer works against an independent SQL repository identity and private raw files.
+        // Existing ZIPs are read through a resolver, never copied, linked, modified or deleted.
+        public sealed class OnlineWorkspace : IDisposable
+        {
+            public readonly string Root, OriginalRoot;
+            internal readonly ConcurrentDictionary<string, bool> PrivateNames = new ConcurrentDictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+            private readonly ServerStorageConfig live, staged;
+            private readonly Dictionary<string, string> baseline;
+            private bool disposed;
+            public OnlineWorkspace(string root)
+            {
+                OriginalRoot = Path.GetFullPath(root); live = Config(root);
+                if (!live.DatabaseOnly) throw new InvalidOperationException("Online maintenance requires MySQL-backed storage");
+                string workspaceParent = Path.Combine(Path.GetPathRoot(OriginalRoot), ".UDA-W");
+                if (Directory.Exists(workspaceParent) && (File.GetAttributes(workspaceParent) & FileAttributes.ReparsePoint) != 0) throw new IOException("维护工作区不能是重解析目录");
+                Root = Path.Combine(workspaceParent, Guid.NewGuid().ToString("N").Substring(0, 16));
+                Directory.CreateDirectory(Root); Directory.CreateDirectory(Path.Combine(Root, ".uda-downloads"));
+                staged = Json().Deserialize<ServerStorageConfig>(Json().Serialize(live)); staged.RepositoryId = Guid.NewGuid().ToString("N");
+                Atomic(ConfigPath(Root), Json().Serialize(staged), true);
+                using (var process = System.Diagnostics.Process.GetCurrentProcess())
+                    Atomic(Path.Combine(Root, ".owner.json"), Json().Serialize(new Dictionary<string, string> { { "root", OriginalRoot }, { "id", staged.RepositoryId }, { "pid", process.Id.ToString() }, { "start", process.StartTime.ToUniversalTime().ToString("o") } }), true);
+                try
+                {
+                    using (var db = Open(Connection(live))) using (var tx = db.BeginTransaction())
+                    {
+                        baseline = CatalogDocuments(db, tx, live.RepositoryId);
+                        if (!baseline.ContainsKey("repo.manifest.json")) throw new IOException("Published catalog missing");
+                        foreach (var row in baseline) Put(db, tx, staged.RepositoryId, row.Key, row.Value, false);
+                        tx.Commit();
+                    }
+                    OnlineWorkspaces[Root] = this;
+                }
+                catch { Dispose(); throw; }
+            }
+            public OfflineRepo Commit(IEnumerable<RetiredDriverDownload> previous)
+            {
+                var manifest = OfflineRepoGenerator.TryLoadManifest(Root);
+                var snapshot = OfflineRepo.FromCatalog(OriginalRoot, manifest);
+                Dictionary<string, string> rows;
+                using (var db = Open(Connection(staged))) rows = CatalogDocuments(db, null, staged.RepositoryId);
+                // Install immutable files before the atomic metadata commit. Failure leaves only safe orphans.
+                string liveDownloads = Path.Combine(OriginalRoot, ".uda-downloads"); Directory.CreateDirectory(liveDownloads);
+                var installed = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                foreach (string file in Directory.GetFiles(Path.Combine(Root, ".uda-downloads"), "*.zip"))
+                {
+                    string target = Path.Combine(liveDownloads, Path.GetFileName(file));
+                    if (!File.Exists(target)) File.Move(file, target);
+                    else if (!string.Equals(OfflineRepoGenerator.Sha256File(file), OfflineRepoGenerator.Sha256File(target), StringComparison.OrdinalIgnoreCase)) throw new IOException("Immutable archive identity collision: " + Path.GetFileName(file));
+                    installed.Add(Path.GetFileName(target));
+                }
+                // Moving a newly verified file changes NTFS metadata, not payload. Keep its checkpoint
+                // bound to the final immutable file identity so later appends do not rehash it.
+                foreach (string key in new[] { "repo.archive-verification.json", "repo.model-archive-verification.json" })
+                {
+                    string text; if (!rows.TryGetValue(key, out text)) continue;
+                    var records = Json().Deserialize<Dictionary<string, ArchiveVerificationRecord>>(text);
+                    foreach (string name in installed.Where(records.ContainsKey))
+                        using (var guard = new FileStream(Path.Combine(liveDownloads, name), FileMode.Open, FileAccess.Read, FileShare.Read)) records[name].FileState = DatabaseArchiveRepository.ArchiveFileState(guard);
+                    rows[key] = Json().Serialize(records);
+                }
+                using (var db = Open(Connection(live))) using (var tx = db.BeginTransaction())
+                {
+                    string current;
+                    using (var cmd = Command(db, tx, "SELECT body FROM uda_documents WHERE repository_id=@p0 AND document_key='repo.manifest.json' FOR UPDATE", live.RepositoryId)) current = Convert.ToString(cmd.ExecuteScalar());
+                    if (current != baseline["repo.manifest.json"]) throw new IOException("仓库已被另一写入任务更新，本次未切换，请重试");
+                    foreach (string key in baseline.Keys.Union(rows.Keys).Where(k => !k.StartsWith("repo.index-block.", StringComparison.Ordinal)))
+                    {
+                        string before, after; baseline.TryGetValue(key, out before); rows.TryGetValue(key, out after);
+                        if (before == after) continue;
+                        if (Get(db, tx, live.RepositoryId, key) != before) throw new IOException("仓库配置已更改，本次未覆盖：" + key);
+                    }
+                    foreach (var row in rows)
+                    { string before; if (!baseline.TryGetValue(row.Key, out before) || before != row.Value) Put(db, tx, live.RepositoryId, row.Key, row.Value, false); }
+                    foreach (string key in baseline.Keys.Except(rows.Keys)) using (var cmd = Command(db, tx, "DELETE FROM uda_documents WHERE repository_id=@p0 AND document_key=@p1", live.RepositoryId, key)) cmd.ExecuteNonQuery();
+                    var tickets = previous.ToList(); string generation = Guid.NewGuid().ToString("N");
+                    for (int offset = 0; offset < tickets.Count; offset += 32) Put(db, tx, live.RepositoryId, "repo.download-history." + generation + "." + offset.ToString("D12") + ".json", Json().Serialize(tickets.Skip(offset).Take(32).ToList()), false);
+                    tx.Commit();
+                }
+                return snapshot;
+            }
+            public void Dispose()
+            {
+                if (disposed) return; disposed = true; OnlineWorkspace ignored; OnlineWorkspaces.TryRemove(Root, out ignored);
+                MachineDriverPackages.ReleaseWorkspaceGates(Root);
+                object unusedGate; Gates.TryRemove(Path.GetFullPath(Root), out unusedGate); string unusedError; Errors.TryRemove(Path.GetFullPath(Root), out unusedError);
+                try { if (staged != null && staged.RepositoryId != live.RepositoryId) using (var db = Open(Connection(staged))) using (var cmd = Command(db, null, "DELETE FROM uda_documents WHERE repository_id=@p0", staged.RepositoryId)) cmd.ExecuteNonQuery(); } catch (Exception ex) { ServiceEventLog.Write("warning", "清理维护工作区 SQL 暂存失败：" + ex.GetType().Name); }
+                string boundary = Path.GetFullPath(Path.Combine(Path.GetPathRoot(OriginalRoot), ".UDA-W")).TrimEnd('\\') + "\\";
+                try { if (Path.GetFullPath(Root).StartsWith(boundary, StringComparison.OrdinalIgnoreCase) && Directory.Exists(Root)) { ValidateWorkspaceTree(Root); Directory.Delete(Root, true); } } catch (Exception ex) { ServiceEventLog.Write("warning", "清理维护工作区文件失败：" + ex.GetType().Name); }
+            }
+        }
         private static string ConfigPath(string root) { return Path.Combine(root, ".uda-storage.json"); }
         public static ServerStorageConfig Config(string root) { string p = ConfigPath(root); return File.Exists(p) ? Json().Deserialize<ServerStorageConfig>(File.ReadAllText(p)) : new ServerStorageConfig(); }
         static ServerStorage()
@@ -748,6 +961,32 @@ namespace UDA
                 return File.Exists(path) ? File.ReadAllText(path, Encoding.UTF8) : null;
             }
         }
+        internal sealed class InstallEventChange
+        {
+            public long Revision; public string Key; public DriverInstallEvent Header; public bool Immutable;
+        }
+        private sealed class InstallEventJournal
+        {
+            public long Revision; public readonly Queue<InstallEventChange> Changes = new Queue<InstallEventChange>();
+        }
+        private static readonly ConcurrentDictionary<string, InstallEventJournal> InstallJournals = new ConcurrentDictionary<string, InstallEventJournal>(StringComparer.OrdinalIgnoreCase);
+        private static InstallEventJournal InstallJournal(string root) { return InstallJournals.GetOrAdd(Path.GetFullPath(root), p => new InstallEventJournal()); }
+        internal static DriverInstallEvent InstallHeader(string text)
+        {
+            try { var e = Json().Deserialize<DriverInstallEvent>(text); if (e != null && e.Detail != null && e.Detail.Length > 512) e.Detail = e.Detail.Substring(0, 512) + "\n（正文按需加载）"; return e; } catch { return null; }
+        }
+        private static void ObserveInstallEvent(string root, string key, string text, bool immutable)
+        {
+            if (!key.StartsWith("install-events/", StringComparison.Ordinal)) return;
+            var journal = InstallJournal(root); var header = text == null ? null : InstallHeader(text);
+            if (text != null && header == null) return;
+            lock (journal) { journal.Changes.Enqueue(new InstallEventChange { Revision = ++journal.Revision, Key = key, Header = header, Immutable = immutable }); while (journal.Changes.Count > 512) journal.Changes.Dequeue(); }
+        }
+        internal static List<InstallEventChange> InstallChanges(string root, long since, out long revision)
+        {
+            var journal = InstallJournal(root);
+            lock (journal) { revision = journal.Revision; if (journal.Changes.Count > 0 && since < journal.Changes.Peek().Revision - 1) return null; return journal.Changes.Where(c => c.Revision > since).ToList(); }
+        }
         public static void Write(string root, string key, string text, bool immutable)
         {
             lock (Gate(root))
@@ -757,6 +996,7 @@ namespace UDA
                 {
                     try { using (var db = Open(Connection(cfg))) Put(db, null, cfg.RepositoryId, key, text, immutable); }
                     catch (Exception ex) { Error(root, ex); throw; }
+                    ObserveInstallEvent(root, key, text, immutable);
                     return;
                 }
                 if (immutable && File.Exists(path)) return;
@@ -765,6 +1005,7 @@ namespace UDA
                 Atomic(path, text);
                 if (cfg.Enabled) try { using (var db = Open(Connection(cfg))) { Put(db, null, cfg.RepositoryId, key, text, immutable); if (immutable) Atomic(path, Get(db, null, cfg.RepositoryId, key)); } File.Delete(marker); }
                 catch (Exception ex) { Error(root, ex); }
+                ObserveInstallEvent(root, key, text, immutable);
             }
         }
         public static void Publish(string root, string key)
@@ -784,11 +1025,12 @@ namespace UDA
                 if (cfg.DatabaseOnly)
                 {
                     using (var db = Open(Connection(cfg))) using (var cmd = Command(db, null, "DELETE FROM uda_documents WHERE repository_id=@p0 AND document_key=@p1", cfg.RepositoryId, key)) cmd.ExecuteNonQuery();
-                    if (File.Exists(path)) File.Delete(path); return;
+                    if (File.Exists(path)) File.Delete(path); ObserveInstallEvent(root, key, null, false); return;
                 }
                 if (cfg.Enabled) Atomic(marker, Json().Serialize(new StoragePending { Key = key, Deleted = true }));
                 if (File.Exists(path)) File.Delete(path);
                 if (cfg.Enabled) try { using (var db = Open(Connection(cfg))) { CheckSchema(db, null); using (var c = Command(db, null, "DELETE FROM uda_documents WHERE repository_id=@p0 AND document_key=@p1", cfg.RepositoryId, key)) c.ExecuteNonQuery(); } File.Delete(marker); } catch (Exception ex) { Error(root, ex); }
+                ObserveInstallEvent(root, key, null, false);
             }
         }
         public static List<string> Events(string root)
@@ -805,6 +1047,47 @@ namespace UDA
                 return rows.Values.ToList();
             }
         }
+        internal static string InstallEventStamp(string root)
+        {
+            var cfg = Config(root);
+            if (!cfg.DatabaseOnly) return Directory.GetLastWriteTimeUtc(Path.Combine(root, "install-events")).Ticks.ToString();
+            using (var db = Open(Connection(cfg))) using (var cmd = Command(db, null, "SELECT COUNT(*),MAX(updated_utc) FROM uda_documents WHERE repository_id=@p0 AND document_key LIKE @p1", cfg.RepositoryId, "install-events/%"))
+            using (var reader = cmd.ExecuteReader()) { reader.Read(); return reader.GetInt64(0) + ":" + (reader.IsDBNull(1) ? 0 : reader.GetDateTime(1).Ticks); }
+        }
+        internal static Dictionary<string, DriverInstallEvent> InstallEventHeaders(string root, out long revision, out string stamp)
+        {
+            lock (Gate(root))
+            {
+                var result = new Dictionary<string, DriverInstallEvent>(StringComparer.Ordinal);
+                var cfg = Config(root);
+                if (cfg.DatabaseOnly)
+                {
+                    long count = 0, latest = 0;
+                    using (var db = Open(Connection(cfg))) using (var cmd = Command(db, null, "SELECT document_key,body,updated_utc FROM uda_documents WHERE repository_id=@p0 AND document_key LIKE @p1", cfg.RepositoryId, "install-events/%"))
+                    using (var reader = cmd.ExecuteReader(System.Data.CommandBehavior.SequentialAccess)) while (reader.Read()) { string key = reader.GetString(0); var e = InstallHeader(reader.GetString(1)); if (e != null) result[key] = e; count++; latest = Math.Max(latest, reader.GetDateTime(2).Ticks); }
+                    stamp = count + ":" + latest;
+                }
+                else { foreach (string text in Events(root)) { var e = InstallHeader(text); if (e != null) result["install-events/" + e.EventId + ".json"] = e; } stamp = InstallEventStamp(root); }
+                InstallChanges(root, long.MaxValue, out revision); return result;
+            }
+        }
+        internal static Dictionary<string, string> InstallEventBodies(string root, IEnumerable<string> eventIds)
+        {
+            var keys = eventIds.Distinct().Select(id => "install-events/" + id + ".json").ToList();
+            if (keys.Count > 100) throw new ArgumentException("At most 100 installation events per detail request");
+            foreach (string key in keys) Safe(root, key);
+            var result = new Dictionary<string, string>(StringComparer.Ordinal);
+            if (keys.Count == 0) return result;
+            var cfg = Config(root);
+            if (cfg.DatabaseOnly)
+            {
+                var args = new List<object> { cfg.RepositoryId }; args.AddRange(keys.Cast<object>());
+                using (var db = Open(Connection(cfg))) using (var cmd = Command(db, null, "SELECT document_key,body FROM uda_documents WHERE repository_id=@p0 AND document_key IN (" + string.Join(",", Enumerable.Range(1, keys.Count).Select(i => "@p" + i)) + ")", args.ToArray()))
+                using (var reader = cmd.ExecuteReader()) while (reader.Read()) result[reader.GetString(0)] = reader.GetString(1);
+            }
+            else foreach (string key in keys) { string body = Read(root, key); if (body != null) result[key] = body; }
+            return result;
+        }
         private static Dictionary<string, string> Snapshot(string root)
         {
             var rows = new Dictionary<string, string>(StringComparer.Ordinal);
@@ -814,9 +1097,54 @@ namespace UDA
             { string body = File.ReadAllText(file); string key = Json().Deserialize<StorageLogBlock>(body).Key; Safe(root, key); rows[key] = body; }
             return rows;
         }
+        // ai-subscription.json is deployment configuration (including a machine-bound
+        // encrypted API key), not a business document. Never migrate or clean it up.
+        private static IEnumerable<string> AiBusinessFiles(string root)
+        {
+            return Directory.GetFiles(root, "ai-*.json").Where(file =>
+                !string.Equals(Path.GetFileName(file), "ai-subscription.json", StringComparison.OrdinalIgnoreCase));
+        }
         private static IEnumerable<string> MetadataFiles(string root)
         { return Directory.GetFiles(root, "repo.*.json").Where(p => Path.GetFileName(p) != "repo.organization-journal.json").Concat(Directory.GetFiles(root, "repo.deleted.txt")); }
         public static void TestConnection(string connection) { using (var db = Open(connection)) { using (var cmd = Command(db, null, "SELECT 1")) cmd.ExecuteScalar(); } }
+        internal static string SetupConnection(string root) { var cfg = Config(root); return cfg.Enabled ? Connection(cfg) : ""; }
+        internal static bool SetupConnectionNeedsRebind(string root)
+        {
+            var cfg = Config(root);
+            if (!cfg.Enabled) return false;
+            try { Connection(cfg); return false; }
+            catch (CryptographicException) { return true; }
+            catch (FormatException) { return true; }
+        }
+        // Used only after the administrator explicitly enters a connection in setup.
+        // Validate the exact existing dataset before changing any on-disk configuration.
+        internal static void RebindSetupConnection(string root, string connection)
+        {
+            lock (Gate(root)) {
+                var cfg = Config(root);
+                if (!cfg.Enabled) throw new InvalidOperationException("仓库尚未启用数据库，请先执行首次迁移。");
+                ValidateMigratedDatabase(cfg, connection);
+                cfg.ProtectedConnection = Convert.ToBase64String(ProtectedData.Protect(Encoding.UTF8.GetBytes(connection), null, DataProtectionScope.LocalMachine));
+                Atomic(ConfigPath(root), Json().Serialize(cfg), true);
+            }
+        }
+
+        internal static void TestSetupConnection(string connection)
+        {
+            using (var db = Open(connection))
+            {
+                Schema(db);
+                using (var tx = db.BeginTransaction())
+                {
+                    string id = Guid.NewGuid().ToString("N"), key = "repo.setup-probe.json";
+                    Put(db, tx, id, key, "{}", false);
+                    Put(db, tx, id, key, "{\"ok\":true}", false);
+                    if (Get(db, tx, id, key) != "{\"ok\":true}") throw new IOException("数据库安装读写验证失败");
+                    using (var cmd = Command(db, tx, "DELETE FROM uda_documents WHERE repository_id=@p0 AND document_key=@p1", id, key)) cmd.ExecuteNonQuery();
+                    tx.Rollback();
+                }
+            }
+        }
         public static void Reconnect(string root, string connection)
         {
             lock (Gate(root))
@@ -896,7 +1224,11 @@ namespace UDA
         {
             var cfg = Config(root);
             if (!cfg.Enabled) throw new InvalidOperationException("拒绝升级：现有数据仍使用文件存储。请先使用 5.2.12 的独立数据库迁移工具完成 MySQL 迁移，再运行本安装程序。");
-            using (var db = Open(Connection(cfg)))
+            ValidateMigratedDatabase(cfg, Connection(cfg));
+        }
+        private static void ValidateMigratedDatabase(ServerStorageConfig cfg, string connection)
+        {
+            using (var db = Open(connection))
             {
                 string text = Get(db, null, cfg.RepositoryId, "repo.manifest.json");
                 if (text == null) throw new InvalidOperationException("MySQL 中缺少现有仓库数据集，拒绝升级");
@@ -924,7 +1256,7 @@ namespace UDA
                 string target = cfg.Enabled ? Connection(cfg) : connection;
                 var report = new StringBuilder();
                 var rows = Snapshot(root);
-                foreach (string file in Directory.GetFiles(root, "ai-*.json")) rows["repo." + Path.GetFileName(file)] = File.ReadAllText(file);
+                foreach (string file in AiBusinessFiles(root)) rows["repo." + Path.GetFileName(file)] = File.ReadAllText(file);
                 using (var db = Open(target))
                 {
                     long packet; using (var cmd = Command(db, null, "SELECT @@max_allowed_packet")) packet = Convert.ToInt64(cmd.ExecuteScalar());
@@ -973,7 +1305,7 @@ namespace UDA
                 if (!preflightConfig.DatabaseOnly) WebAdminController.MigrateUploadMetadata(root);
                 using (var db = Open(Connection(preflightConfig)))
                 {
-                    foreach (string file in MetadataFiles(root).Concat(Directory.GetFiles(root, "ai-*.json")).ToArray())
+                    foreach (string file in MetadataFiles(root).Concat(AiBusinessFiles(root)).ToArray())
                     {
                         string key = Path.GetFileName(file); if (key.StartsWith("ai-", StringComparison.Ordinal)) key = "repo." + key;
                         // A leftover file is never allowed to overwrite the authoritative SQL row.
@@ -1030,7 +1362,7 @@ namespace UDA
                 }
                 if (prepareOnly) return; // Staged migration keeps the old server and all local originals usable.
                 cfg.DatabaseOnly = true; Atomic(ConfigPath(root), Json().Serialize(cfg), true);
-                foreach (string file in MetadataFiles(root).Concat(Directory.GetFiles(root, "ai-*.json")).ToArray()) File.Delete(file);
+                foreach (string file in MetadataFiles(root).Concat(AiBusinessFiles(root)).ToArray()) File.Delete(file);
                 if (File.Exists(index)) File.Delete(index);
                 string cursorDirectory = Path.Combine(root, ".uda-log-cursors"); if (Directory.Exists(cursorDirectory)) foreach (string file in Directory.GetFiles(cursorDirectory, "*.json")) File.Delete(file);
                 string events = Path.Combine(root, "install-events"); if (Directory.Exists(events)) foreach (string file in Directory.GetFiles(events, "*.json"))
@@ -1043,6 +1375,34 @@ namespace UDA
         }
         public static void RestoreFileCompatibility(string root)
         { lock (Gate(root)) { DatabaseArchiveRepository.ExpandForMaintenance(root); var cfg = Config(root); cfg.DatabaseOnly = false; Atomic(ConfigPath(root), Json().Serialize(cfg), true); } }
+        public static int[] ImportHistoricalEvents(string root, IList<DriverInstallEvent> entries)
+        {
+            lock (Gate(root))
+            {
+                int added = 0, skipped = 0; var cfg = Config(root); var json = Json(); var inserted = new List<DriverInstallEvent>();
+                if (cfg.Enabled)
+                {
+                    using (var db = Open(Connection(cfg))) using (var tx = db.BeginTransaction())
+                    {
+                        foreach (var entry in entries)
+                        {
+                            string key = "install-events/" + entry.EventId + ".json";
+                            if (Get(db, tx, cfg.RepositoryId, key) != null) { skipped++; continue; }
+                            Put(db, tx, cfg.RepositoryId, key, json.Serialize(entry), true); added++; inserted.Add(entry);
+                        }
+                        tx.Commit();
+                    }
+                    foreach (var entry in inserted) ObserveInstallEvent(root, "install-events/" + entry.EventId + ".json", json.Serialize(entry), true);
+                }
+                else foreach (var entry in entries)
+                {
+                    string key = "install-events/" + entry.EventId + ".json";
+                    if (File.Exists(Safe(root, key))) { skipped++; continue; }
+                    Write(root, key, json.Serialize(entry), true); added++;
+                }
+                return new[] { added, skipped };
+            }
+        }
         public static Dictionary<string, string> RecentDocuments(string root, string prefix, int limit)
         {
             limit = Math.Max(1, Math.Min(100, limit)); var cfg = Config(root);

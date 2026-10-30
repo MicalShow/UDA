@@ -1,7 +1,8 @@
-<# Run in full Windows as LocalSystem or administrator, not WinPE. No reboot is performed. #>
+﻿<# Run in full Windows as LocalSystem or administrator, not WinPE. No reboot is performed. #>
 [CmdletBinding()]
-param([string]$ClientExe = (Join-Path $PSScriptRoot 'UDA-Client.exe'), [string]$ServerUrl)
+param([string]$ClientExe, [string]$ServerUrl)
 $ErrorActionPreference = 'Stop'
+if ([string]::IsNullOrWhiteSpace($ClientExe)) { $ClientExe = Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) 'UDA-Client.exe' }
 try {
     $clientPath = (Resolve-Path -LiteralPath $ClientExe).Path
     $arguments = '--sccm'

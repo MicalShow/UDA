@@ -28,12 +28,14 @@ $sources = @(
   (Join-Path $scriptRoot 'DriverIndexCore.cs'),
   (Join-Path $scriptRoot 'InfApplicability.cs'),
   (Join-Path $scriptRoot 'DriverIndexIntegration.cs'),
+  (Join-Path $scriptRoot 'DriverSelectionWorker.cs'),
   (Join-Path $scriptRoot 'OfflineRepo.cs'),
   (Join-Path $scriptRoot 'ServerStorage.cs'),
   (Join-Path $scriptRoot 'ClusterRouting.cs'),
   (Join-Path $scriptRoot 'LanDriverService.cs'),
   (Join-Path $scriptRoot 'LanEditionForm.cs'),
   (Join-Path $scriptRoot 'WebAdmin.cs'),
+  (Join-Path $scriptRoot 'AiDriverTasks.cs'),
   (Join-Path $scriptRoot 'NicBootstrap.cs'),
   (Join-Path $scriptRoot 'Phase3Dispatch.cs'),
   (Join-Path $scriptRoot 'ConfigEditorForm.cs'),
@@ -89,6 +91,7 @@ function Build-Directory {
     Copy-Item -LiteralPath (Join-Path $Dir 'UniversalDriverAssistant.exe') -Destination (Join-Path $Dir '万能驱动助手-局域网络版.exe') -Force
     Copy-Item -LiteralPath (Join-Path $Dir 'UniversalDriverAssistant.exe.config') -Destination (Join-Path $Dir '万能驱动助手-局域网络版.exe.config') -Force
   }
+  Compile-Exe $Dir 'UDA-Driver-Selection.exe' 'UDA.DriverSelectionProgram' 'exe' $genManifest
   # Configuration generator (GUI, asInvoker).
   Compile-Exe $Dir 'DriverConfigGenerator.exe' 'UDA.ConfigGeneratorProgram' 'winexe' $genManifest
   # Offline repository generator / config tool (console, asInvoker).
@@ -104,7 +107,7 @@ function Build-Directory {
   }
   if ($IncludeServer) { [IO.File]::WriteAllText((Join-Path $Dir 'LanEdition.flag'), 'LAN', (New-Object Text.UTF8Encoding($false))) }
   # Ship the config, SCCM registration script, NIC sources catalog and docs.
-  $files = @('DriverConfig.json','Register-SCCM.ps1','Invoke-UdaSccm.ps1','SCCM-AUTODEPLOY.md','README.md','DEPLOY-LAN.md','DATABASE-MIGRATION.md','MIGRATION-PREFLIGHT.md','Get-UdaMachineInfo.ps1','MACHINE-PACKAGES.md','SCAN-PERFORMANCE.md','ARCHIVE-VERIFICATION.md','UPGRADE-SERVICE-STOP.md','INCREMENTAL-IMPORT.md','NicBootstrapSources.json','Verify-PhysicalNetworkClient.ps1','Verify-PhysicalClusterClient.ps1')
+  $files = @('DriverConfig.json','Collect-UdaDriverFailure.ps1','HP-AUDIO.md','EXTENSION-DRIVERS.md','MANUAL-DRIVER-VERSIONS.md','Register-SCCM.ps1','Invoke-UdaSccm.ps1','SCCM-AUTODEPLOY.md','AI-DRIVER-TASKS.md','ONLINE-MAINTENANCE.md','README.md','DEPLOY-LAN.md','DATABASE-MIGRATION.md','MIGRATION-PREFLIGHT.md','Get-UdaMachineInfo.ps1','MACHINE-PACKAGES.md','SCAN-PERFORMANCE.md','ARCHIVE-VERIFICATION.md','UPGRADE-SERVICE-STOP.md','INCREMENTAL-IMPORT.md','NicBootstrapSources.json','Verify-PhysicalNetworkClient.ps1','Verify-PhysicalClusterClient.ps1')
   foreach ($f in $files) { $src = Join-Path $scriptRoot $f; if (Test-Path -LiteralPath $src) { Copy-Item -LiteralPath $src -Destination $Dir -Force } }
 }
 
@@ -146,7 +149,7 @@ Copy-BootstrapRepo -Src $BootstrapRepo -OfflineDir $offlineDir -LanDir $lanDir
 # requests a client package from the web console.
 $clientTemplate = Join-Path $lanDir 'ClientTemplate'
 New-Item -ItemType Directory -Path $clientTemplate -Force | Out-Null
-$clientFiles = @('UniversalDriverAssistant.exe','UniversalDriverAssistant.exe.config','万能驱动助手-局域网络版.exe','万能驱动助手-局域网络版.exe.config','UDA-Client-Launcher.exe','UDA-Client-Launcher.exe.config','DriverConfig.json','LanEdition.flag','README.md','DEPLOY-LAN.md')
+$clientFiles = @('UDA-Driver-Selection.exe','UDA-Driver-Selection.exe.config','UniversalDriverAssistant.exe','UniversalDriverAssistant.exe.config','万能驱动助手-局域网络版.exe','万能驱动助手-局域网络版.exe.config','UDA-Client-Launcher.exe','UDA-Client-Launcher.exe.config','DriverConfig.json','LanEdition.flag','README.md','DEPLOY-LAN.md','Collect-UdaDriverFailure.ps1','HP-AUDIO.md','EXTENSION-DRIVERS.md','MANUAL-DRIVER-VERSIONS.md')
 foreach ($f in $clientFiles) {
   $src = Join-Path $lanDir $f
   if (Test-Path -LiteralPath $src) { Copy-Item -LiteralPath $src -Destination $clientTemplate -Force }
@@ -168,7 +171,7 @@ $setupExe = Join-Path $serverStage '万能驱动助手-服务端安装程序.exe
 # requires elevation (Win32 error 740). Start asInvoker, then the installer explicitly relaunches
 # itself with the runas verb and waits, keeping IExpress' temporary payload alive.
 Compile-Exe $serverStage '万能驱动助手-服务端安装程序.exe' 'UDA.ServerSetupProgram' 'winexe' $genManifest
-$serverFiles = @('LanDriverService.exe','LanDriverService.exe.config','UDA-Server-Manager.exe','UDA-Server-Manager.exe.config','UDA-Database-Migration.exe','UDA-Database-Migration.exe.config','Install-LanService.ps1','OfflineRepoGenerator.exe','OfflineRepoGenerator.exe.config','README.md','DEPLOY-LAN.md','DATABASE-MIGRATION.md','Verify-PhysicalNetworkClient.ps1','Verify-PhysicalClusterClient.ps1','Invoke-UdaSccm.ps1','SCCM-AUTODEPLOY.md')
+$serverFiles = @('LanDriverService.exe','LanDriverService.exe.config','UDA-Server-Manager.exe','UDA-Server-Manager.exe.config','UDA-Database-Migration.exe','UDA-Database-Migration.exe.config','Install-LanService.ps1','OfflineRepoGenerator.exe','OfflineRepoGenerator.exe.config','README.md','Collect-UdaDriverFailure.ps1','HP-AUDIO.md','EXTENSION-DRIVERS.md','MANUAL-DRIVER-VERSIONS.md','ONLINE-MAINTENANCE.md','AI-DRIVER-TASKS.md','DEPLOY-LAN.md','DATABASE-MIGRATION.md','Verify-PhysicalNetworkClient.ps1','Verify-PhysicalClusterClient.ps1','Invoke-UdaSccm.ps1','SCCM-AUTODEPLOY.md')
 foreach ($f in $serverFiles) {
   $src = Join-Path $lanDir $f
   if (Test-Path -LiteralPath $src) { Copy-Item -LiteralPath $src -Destination $serverStage -Force }
@@ -185,7 +188,7 @@ $payloadZip = Join-Path $serverStage 'ServerPayload.zip'
 $payloadItems = Get-ChildItem -LiteralPath $serverStage | Where-Object { $_.Name -ne '万能驱动助手-服务端安装程序.exe' -and $_.Name -ne 'ServerPayload.zip' }
 Compress-Archive -LiteralPath $payloadItems.FullName -DestinationPath $payloadZip -CompressionLevel Optimal -Force
 $sedPath = Join-Path $packagesDir 'server-setup.sed'
-$singleSetup = Join-Path $packagesDir 'UDA-Server-Setup-v5.3.9.exe'
+$singleSetup = Join-Path $packagesDir 'UDA-Server-Setup-v5.3.45.exe'
 $setupSource = $serverStage.TrimEnd('\') + '\'
 $sed = @(
   '[Version]','Class=IEXPRESS','SEDVersion=3','[Options]','PackagePurpose=InstallApp','ShowInstallProgramWindow=1',
@@ -197,7 +200,7 @@ $sed = @(
 )
 Copy-Item -LiteralPath $setupExe -Destination (Join-Path $serverStage 'UDA-Server-Setup-GUI.exe') -Force
 [IO.File]::WriteAllLines($sedPath, $sed, [Text.Encoding]::Default)
-Compile-Exe $packagesDir 'UDA-Server-Setup-v5.3.9.exe' 'UDA.ServerSetupProgram' 'winexe' $winManifest $payloadZip
+Compile-Exe $packagesDir 'UDA-Server-Setup-v5.3.45.exe' 'UDA.ServerSetupProgram' 'winexe' $winManifest $payloadZip
 if (-not (Test-Path -LiteralPath $singleSetup)) { throw "IExpress 未能生成单文件安装程序: $singleSetup" }
 Remove-Item -LiteralPath $sedPath -Force -ErrorAction SilentlyContinue
 

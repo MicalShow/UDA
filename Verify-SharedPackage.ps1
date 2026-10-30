@@ -1,4 +1,4 @@
-param([string]$OutputDirectory='web-console-payload-path')
+﻿param([string]$OutputDirectory='web-console-payload-path')
 $ErrorActionPreference='Stop'
 $assembly=[Reflection.Assembly]::LoadFrom((Join-Path $PSScriptRoot ($OutputDirectory+'\Lan\UDA-Server-Manager.exe')))
 $root=Join-Path $PSScriptRoot ($OutputDirectory+'\shared-test-'+[Guid]::NewGuid().ToString('N'));$repo=Join-Path $root 'repo'

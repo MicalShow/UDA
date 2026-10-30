@@ -1,4 +1,4 @@
-﻿# 完整迁移准备工具
+# 完整迁移准备工具
 
 将压缩包内所有文件解压到现有服务端程序目录，保留原 manager-url.txt。请先备份数据库和仓库。双击 UDA-Database-Migration.exe，输入 UDA admin 账号密码登录。
 

@@ -36,6 +36,22 @@ namespace UDA
                 T(!InfApplicability.Evaluate(rec, target, new[] { "ACPI\\LEN9999" }, null).Applicable, "Unrelated ACPI device must not match");
                 T(!InfApplicability.Evaluate(rec, Target("x86", 10, 19045), new[] { "ACPI\\LEN0068" }, null).Applicable, "ACPI match must retain architecture gate");
             });
+            Run("DecoratedEntries.ActiveSectionOnly", () => {
+                string hw = @"INTELAUDIO\FUNC_01&VEN_8086&DEV_2812&SUBSYS_80860101";
+                string changed = @"INTELAUDIO\SGPC_FUNC_01&VEN_8086&DEV_2812&SUBSYS_80860101";
+                string header = "[Version]\nSignature=\"$Windows NT$\"\nClass=MEDIA\n[Manufacturer]\nIntel=IntelGfx,NTamd64.10.0...18362,NTamd64.10.0...19041\n";
+                string body = "[IntelGfx.NTamd64.10.0...18362]\nAudio=Install," + hw + "\n[IntelGfx.NTamd64.10.0...19041]\nAudio=Install," + changed + "\n";
+                var rec = ParseInf(root, "active-audio.inf", header + body);
+                T(InfApplicability.Evaluate(rec, Target("amd64", 10, 18363), new[] { hw }, null).Applicable, "older OS uses FUNC section");
+                T(!InfApplicability.Evaluate(rec, Target("amd64", 10, 26300), new[] { hw }, null).Applicable, "new OS cannot borrow FUNC ID from inactive older section");
+                T(InfApplicability.Evaluate(rec, Target("amd64", 10, 26300), new[] { changed }, null).Applicable, "active SGPC ID remains applicable");
+                rec.ModelSections.Clear();
+                T(!InfApplicability.Evaluate(rec, Target("amd64", 10, 26300), new[] { hw }, null).Applicable, "old database metadata also excludes inactive IDs without reindex");
+                rec = ParseInf(root, "empty-audio.inf", header + "[IntelGfx.NTamd64.10.0...18362]\nAudio=Install," + hw + "\n[IntelGfx.NTamd64.10.0...19041]\n");
+                T(!InfApplicability.Evaluate(rec, Target("amd64", 10, 26300), new[] { hw }, null).Applicable, "empty newer Models section blocks fallback");
+                rec = ParseInf(root, "two-manufacturers.inf", header.Replace("Intel=", "Other=Other,NTamd64.10.0...22000\nIntel=") + body + "[Other.NTamd64.10.0...22000]\nOther=Install,PCI\\VEN_1234&DEV_5678\n");
+                T(InfApplicability.Evaluate(rec, Target("amd64", 10, 26300), new[] { changed }, null).Applicable, "separate manufacturer section does not suppress Intel group");
+            });
             Run("DecoratedEntries.PerEntryGate", () => TestPerEntryDecoration(root));
             Run("DecoratedEntries.DottedManufacturerBase", () => {
                 var rec = ParseInf(root, "dotted-base.inf", "[Version]\nSignature=\"$Windows NT$\"\nClass=System\n[Manufacturer]\nLenovo=ibm.Mfg,NTx86,NTamd64\n[ibm.Mfg.NTx86]\nPower=Install,ACPI\\LEN0268\n[ibm.Mfg.NTamd64]\nPower=Install,ACPI\\LEN0268\n[ibm.Mfg.NTamd64.Services]\nFake=Install,ACPI\\LEN9999\n[ibm.Mfg.NTarm64]\nFake=Install,ACPI\\LEN9999\n");
